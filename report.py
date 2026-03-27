@@ -193,7 +193,22 @@ def _motor_issue_summary(issues: list) -> str:
     current = [i for i in issues if "current spike" in i.message or "stator current" in i.message]
     temp = [i for i in issues if "temperature" in i.message.lower()]
     stall = [i for i in issues if "stall" in i.message.lower() and "sticky" not in i.message]
-
+    output_lost = [i for i in issues if "OUTPUT LOST" in i.message]
+    brake = [i for i in issues if "BRAKE DISABLED" in i.message]
+    drift = [i for i in issues if "drift" in i.message.lower()]
+    divergence = [i for i in issues if "diverge" in i.message.lower()]
+    has_reset = [i for i in issues if "HasReset" in i.message]
+    vel_error = [i for i in issues if "velocity error" in i.message]
+    curr_limit = [i for i in issues if "CurrLimit" in i.message]
+    supply_fault = [i for i in issues if "OverSupplyV" in i.message or "UnstableSupplyV" in i.message]
+    # Catch-all for any remaining non-INFO, non-sticky issues
+    known_msgs = (starved + rebooted + brownout + hw_fault + sags + current +
+                  temp + stall + output_lost + brake + drift + divergence +
+                  has_reset + vel_error + curr_limit + supply_fault)
+    known_set = set(id(i) for i in known_msgs)
+    # Exclude sticky faults (INFO) from uncategorized
+    other = [i for i in issues if id(i) not in known_set
+             and i.severity != "INFO" and "sticky" not in i.message.lower()]
 
     if starved:
         dur = sum(i.time_end - i.time_start for i in starved if i.time_end > 0)
@@ -210,11 +225,30 @@ def _motor_issue_summary(issues: list) -> str:
         parts.append(f"current spike ×{len(current)}")
     if stall:
         parts.append(f"stall ×{len(stall)}")
+    if output_lost:
+        parts.append(f"output lost ×{len(output_lost)}")
+    if brake:
+        parts.append("brake disabled")
+    if drift:
+        parts.append(f"drift ×{len(drift)}")
+    if divergence:
+        parts.append(f"divergence ×{len(divergence)}")
+    if has_reset:
+        parts.append("HasReset")
+    if vel_error:
+        parts.append(f"velocity error ×{len(vel_error)}")
+    if curr_limit:
+        parts.append(f"current limited ×{len(curr_limit)}")
+    if supply_fault:
+        parts.append(f"supply fault ×{len(supply_fault)}")
     if sags:
         parts.append(f"voltage sag ×{len(sags)}")
+    # Catch-all for any non-INFO issue not matched above
+    if other:
+        parts.append(f"{len(other)} other issue(s)")
     # Sticky faults at startup are INFO-level; excluded from motor summary
 
-    return ", ".join(parts) if parts else "—"
+    return ", ".join(parts) if parts else "ok"
 
 
 # ── ANSI fallback renderer ────────────────────────────────────────────────────

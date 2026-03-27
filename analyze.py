@@ -16,12 +16,13 @@ import re
 import sys
 
 from parser import parse_wpilog, get_enabled_intervals, get_match_info, get_game_mode_timeline
+from timestamp_sync import compute_hoot_offset, apply_offset
 from revlog_parser import parse_revlog
 from hoot_converter import parse_hoot
 from device_config import load_device_config, DeviceConfig
 from signals import duration, get
 from analyzers import (analyze_electrical, analyze_mechanical, analyze_revlog,
-                       analyze_hoot, analyze_motor_groups, roll_up)
+                       analyze_hoot, analyze_motor_groups, analyze_radio, roll_up)
 from analyzers.subsystems import motor_roll_up
 from report import print_report, print_batch_header, print_batch_row
 
@@ -86,10 +87,69 @@ def discover_files(directory: str, timestamp: str) -> dict:
     return result
 
 
+def discover_by_match(directory: str, match_id: str) -> dict:
+    """
+    Auto-discover log files by FMS match identifier (e.g., "Q32", "VAALE1_Q32").
+
+    CTRE hoot files include the match ID in the filename:
+        VAALE1_Q32_rio_2025-09-27_14-08-53.hoot
+        VAALE1_Q32_88E409BF...FF_2025-09-27_14-08-53.hoot
+
+    This function finds hoot files matching the match ID, extracts the timestamp,
+    then discovers wpilog/revlog files by that timestamp.
+
+    Args:
+        directory: Root directory to search recursively
+        match_id: Match identifier — "Q32", "E10", "VAALE1_Q32", etc.
+
+    Returns:
+        dict with keys: wpilog, revlog, hoot (list of hoot file paths)
+    """
+    # Build a pattern that matches the match ID as a delimited component.
+    # "Q32" should match "VAALE1_Q32_rio_..." but not "Q320_..."
+    # The match ID appears between underscores (or at start of filename).
+    match_id_upper = match_id.upper()
+
+    hoot_files = []
+    extracted_ts = None
+
+    for dirpath, _dirnames, filenames in os.walk(directory):
+        for f in filenames:
+            if not f.endswith(".hoot"):
+                continue
+            f_upper = f.upper()
+            # Check if match_id appears as a delimited component
+            # e.g., "VAALE1_Q32_" or "_Q32_" in the filename
+            if f"_{match_id_upper}_" in f_upper or f_upper.startswith(f"{match_id_upper}_"):
+                hoot_files.append(os.path.join(dirpath, f))
+                # Extract timestamp from filename (YYYY-MM-DD_HH-MM-SS pattern)
+                if extracted_ts is None:
+                    ts_match = re.search(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", f)
+                    if ts_match:
+                        extracted_ts = ts_match.group(1)
+
+    if not hoot_files:
+        return {"wpilog": None, "revlog": None, "hoot": []}
+
+    # Use the extracted timestamp to find wpilog/revlog
+    result = {"wpilog": None, "revlog": None, "hoot": hoot_files}
+
+    if extracted_ts:
+        ts_discovery = discover_files(directory, extracted_ts)
+        result["wpilog"] = ts_discovery["wpilog"]
+        result["revlog"] = ts_discovery["revlog"]
+        # Merge any hoot files found by timestamp that weren't already matched
+        for h in ts_discovery["hoot"]:
+            if h not in result["hoot"]:
+                result["hoot"].append(h)
+
+    return result
+
+
 def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
                  verbose: bool = False, revlog_path: str = None,
                  hoot_paths: list = None, detail_level: str = "ERR",
-                 config: DeviceConfig = None) -> list:
+                 config: DeviceConfig = None, clean: bool = False) -> list:
     """Parse and analyze a single log file. Returns list of SubsystemStatus."""
     channels, types = {}, {}
     if filepath:
@@ -109,6 +169,7 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
 
     elec_issues = analyze_electrical(channels, can_map)
     mech_issues = analyze_mechanical(channels, can_map)
+    radio_issues = analyze_radio(channels)
 
     # Collect all device channels for motor group analysis
     all_device_channels = dict(channels)
@@ -126,12 +187,24 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
             print(f"Error reading {revlog_path}: {e}", file=sys.stderr)
 
     hoot_issues = []
+    converted_files = []
     for hoot_path in (hoot_paths or []):
         try:
             hoot_channels, hoot_types, header = parse_hoot(hoot_path)
+            # Track the converted file for cleanup
+            base = os.path.splitext(hoot_path)[0]
+            converted = base + "_converted.wpilog"
+            if os.path.isfile(converted):
+                converted_files.append(converted)
+            # Sync hoot timestamps to wpilog using RobotEnable
+            if game_timeline:
+                offset = compute_hoot_offset(hoot_channels, game_timeline)
+                if offset is not None:
+                    hoot_channels = apply_offset(hoot_channels, offset)
             bus_name = header.get("bus_name", "")
             hoot_issues.extend(analyze_hoot(hoot_channels, can_map,
-                                            bus_name=bus_name, config=config))
+                                            bus_name=bus_name, config=config,
+                                            game_timeline=game_timeline))
             all_device_channels.update(hoot_channels)
             if verbose:
                 for name in list(hoot_channels.keys()):
@@ -148,7 +221,7 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
     if config and config.groups:
         group_issues = analyze_motor_groups(all_device_channels, config)
 
-    all_issues = elec_issues + mech_issues + rev_issues + hoot_issues + group_issues
+    all_issues = elec_issues + mech_issues + radio_issues + rev_issues + hoot_issues + group_issues
 
     extra_subs = config.extra_subsystems if config else []
     statuses = roll_up(all_issues, extra_subsystems=extra_subs)
@@ -170,6 +243,16 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
 
     if verbose:
         _print_verbose(channels, types)
+
+    if clean and converted_files:
+        print(f"\nCleaning up {len(converted_files)} temporary file(s):",
+              file=sys.stderr)
+        for f in converted_files:
+            print(f"  removing {f}", file=sys.stderr)
+            try:
+                os.remove(f)
+            except OSError as e:
+                print(f"  failed: {e}", file=sys.stderr)
 
     return statuses
 
@@ -216,9 +299,11 @@ def main():
     parser.add_argument("--hoot", metavar="FILE", nargs="+",
                         help="Path to .hoot file(s) (CTRE Phoenix 6 signal logs)")
     parser.add_argument("--dir", "-d", metavar="DIR",
-                        help="Directory containing log files (use with --time)")
+                        help="Directory containing log files (use with --time or --match)")
     parser.add_argument("--time", "-t", metavar="TIMESTAMP",
                         help="Timestamp prefix for auto-discovery (e.g., 2026-03-24_23-38)")
+    parser.add_argument("--match", "-m", metavar="ID",
+                        help="FMS match identifier (e.g., Q32, VAALE1_Q32)")
     parser.add_argument("--subsystem", "-s", metavar="NAME",
                         help="Filter output to one subsystem (e.g. SHOOTER)")
     parser.add_argument("--warn", "-w", action="store_true",
@@ -229,6 +314,8 @@ def main():
                         help="Show all available channels")
     parser.add_argument("--batch", "-b", metavar="DIR",
                         help="Batch-analyze all .wpilog files in directory")
+    parser.add_argument("--clean", action="store_true",
+                        help="Remove temporary files (*_converted.wpilog) after analysis")
 
     args = parser.parse_args()
 
@@ -279,6 +366,45 @@ def main():
             hoot_paths=found["hoot"],
             detail_level=detail_level,
             config=config,
+            clean=args.clean,
+        )
+        return
+
+    # Match ID discovery mode
+    if args.dir and args.match:
+        if not os.path.isdir(args.dir):
+            print(f"Directory not found: {args.dir}", file=sys.stderr)
+            sys.exit(1)
+
+        found = discover_by_match(args.dir, args.match)
+        sources = []
+        if found["wpilog"]:
+            sources.append(f"wpilog: {os.path.basename(found['wpilog'])}")
+        if found["revlog"]:
+            sources.append(f"revlog: {os.path.basename(found['revlog'])}")
+        for h in found["hoot"]:
+            sources.append(f"hoot: {os.path.basename(h)}")
+
+        if not any([found["wpilog"], found["revlog"], found["hoot"]]):
+            print(f"No log files found matching match '{args.match}' in {args.dir}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Match {args.match} — discovered {len(sources)} file(s):")
+        for s in sources:
+            print(f"  {s}")
+        print()
+
+        analyze_file(
+            filepath=found["wpilog"],
+            can_map=can_map,
+            subsystem_filter=args.subsystem,
+            verbose=args.verbose,
+            revlog_path=found["revlog"],
+            hoot_paths=found["hoot"],
+            detail_level=detail_level,
+            config=config,
+            clean=args.clean,
         )
         return
 
@@ -309,6 +435,7 @@ def main():
         hoot_paths=args.hoot,
         detail_level=detail_level,
         config=config,
+        clean=args.clean,
     )
 
 

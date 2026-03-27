@@ -13,6 +13,7 @@ Detects issues from CTRE device telemetry (TalonFX, CANcoder, Pigeon2, CANdle):
 from signals import get, find_channels, find_threshold_spans, fmt_time
 from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO
 from device_config import DeviceConfig
+from parser import get_game_mode_at, MODE_DISABLED
 
 DEFAULT_SUBSYSTEM = "HOOT"
 
@@ -29,14 +30,18 @@ _WARN_FAULTS = [
     "Fault_ProcTemp",
     "Fault_OverSupplyV",
     "Fault_UnstableSupplyV",
-    "Fault_StatorCurrLimit",
-    "Fault_SupplyCurrLimit",
     "Fault_BadMagnet",
     "Fault_ShortCircuit",
     "Fault_Thermal",
     "Fault_SaturatedAccelerometer",
     "Fault_SaturatedGyroscope",
     "Fault_SaturatedMagnetometer",
+]
+
+# Faults that are only meaningful when the robot is enabled (not DISABLED)
+_ENABLED_ONLY_FAULTS = [
+    "Fault_StatorCurrLimit",
+    "Fault_SupplyCurrLimit",
 ]
 
 # Thresholds
@@ -73,7 +78,7 @@ def _device_key(device_prefix: str) -> str:
 
 
 def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
-                 config: DeviceConfig = None) -> list[Issue]:
+                 config: DeviceConfig = None, game_timeline: list = None) -> list[Issue]:
     issues = []
     can_map = can_map or {}
     config = config
@@ -93,7 +98,8 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
             motor_name = can_map.get(key, short)
             subsystem = DEFAULT_SUBSYSTEM
         label = motor_name + bus_tag  # full label for messages
-        detail = motor_name           # clean name for motor status grouping
+        # Only actual motors appear in MOTOR STATUS table
+        detail = motor_name if device_type == "TalonFX" else None
 
         # --- Active critical faults ---
         for fault_name in _CRITICAL_FAULTS:
@@ -117,6 +123,26 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
                 continue
             series = get(channels, f"{prefix}/{fault_name}")
             active = [(t, v) for t, v in series if v > 0.5]
+            if active:
+                issues.append(Issue(
+                    severity=SEVERITY_WARN,
+                    subsystem=subsystem,
+                    message=f"{label} {fault_name.replace('Fault_', '')}"
+                            f" at {fmt_time(active[0][0])}",
+                    time_start=active[0][0],
+                    detail=detail,
+                ))
+
+        # --- Enabled-only faults (ignore when DISABLED) ---
+        for fault_name in _ENABLED_ONLY_FAULTS:
+            if fault_name not in signals:
+                continue
+            series = get(channels, f"{prefix}/{fault_name}")
+            if game_timeline:
+                active = [(t, v) for t, v in series
+                          if v > 0.5 and get_game_mode_at(game_timeline, t) != MODE_DISABLED]
+            else:
+                active = [(t, v) for t, v in series if v > 0.5]
             if active:
                 issues.append(Issue(
                     severity=SEVERITY_WARN,

@@ -110,23 +110,23 @@ def analyze_revlog(channels: dict, can_map: dict = None,
         applied_series = channels.get(f"{prefix}/AppliedOutput", [])
         vel_series     = channels.get(f"{prefix}/Velocity", [])
         if applied_series and vel_series:
-            # Build a time-indexed lookup for velocity
-            vel_map = {t: v for t, v in vel_series}
-            vel_times = sorted(vel_map)
-
-            def nearest_vel(t: float) -> float | None:
-                if not vel_times:
-                    return None
-                idx = min(range(len(vel_times)), key=lambda i: abs(vel_times[i] - t))
-                return vel_map[vel_times[idx]]
+            import bisect
+            vel_times = [t for t, _ in vel_series]
+            vel_vals = [v for _, v in vel_series]
 
             # Build a "stall proxy" series: 1.0 if stalling, 0.0 otherwise
             stall_proxy = []
             for t, app in applied_series:
-                vel = nearest_vel(t)
-                if vel is None:
-                    stall_proxy.append((t, 0.0))
-                    continue
+                # Binary search for nearest velocity sample
+                idx = bisect.bisect_left(vel_times, t)
+                if idx == 0:
+                    vel = vel_vals[0]
+                elif idx >= len(vel_times):
+                    vel = vel_vals[-1]
+                elif t - vel_times[idx - 1] <= vel_times[idx] - t:
+                    vel = vel_vals[idx - 1]
+                else:
+                    vel = vel_vals[idx]
                 stalling = abs(app) > _STALL_CURRENT_A and abs(vel) < _STALL_VEL_RPM
                 stall_proxy.append((t, 1.0 if stalling else 0.0))
 

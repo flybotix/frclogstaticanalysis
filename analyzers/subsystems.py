@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO, SEVERITY_OK
 
 
-DEFAULT_SUBSYSTEMS = ["ELECTRICAL", "SHOOTER", "INTAKE", "TURRET", "SWERVE", "CAN", "MOTORS"]
+DEFAULT_SUBSYSTEMS = ["ELECTRICAL", "RADIO", "SHOOTER", "INTAKE", "TURRET", "SWERVE", "CAN", "MOTORS"]
 
 # HOOT and REVLOG issues are merged into MOTORS for display
 _MOTOR_SUBSYSTEMS = {"HOOT", "REVLOG"}
@@ -82,6 +82,32 @@ def _summarize(subsystem: str, issues: list[Issue]) -> str:
             parts.append("low battery")
         if spikes:
             parts.append(f"current spike ×{len(spikes)}")
+        return ", ".join(parts) if parts else f"{len(issues)} issue(s)"
+
+    if subsystem == "RADIO":
+        parts = []
+        disconnects = [i for i in issues if "disconnected" in i.message]
+        dropouts = [i for i in issues if "dropout" in i.message.lower()]
+        err_gaps = [i for i in issues if "loss of driver" in i.message]
+        warn_gaps = [i for i in issues if "500–1000ms" in i.message]
+        weak_signal = [i for i in issues if "Weak signal" in i.message or "Marginal signal" in i.message]
+        low_snr = [i for i in issues if "SNR" in i.message]
+        low_rate = [i for i in issues if "link rate" in i.message]
+        if disconnects:
+            parts.append(f"radio disconnect ×{len(disconnects)}")
+        if dropouts:
+            total = sum(int(i.message.split("×")[1].split()[0]) for i in dropouts)
+            parts.append(f"comms dropout ×{total}")
+        if err_gaps:
+            parts.append(f"data loss ×{len(err_gaps)}")
+        if warn_gaps:
+            parts.append("latency spikes")
+        if weak_signal:
+            parts.append("weak signal")
+        if low_snr:
+            parts.append("low SNR")
+        if low_rate:
+            parts.append("degraded link rate")
         return ", ".join(parts) if parts else f"{len(issues)} issue(s)"
 
     if subsystem == "CAN":
@@ -190,15 +216,20 @@ def motor_roll_up(all_issues: list[Issue]) -> list[MotorStatus]:
     """
     Build per-motor status from issues that have a `detail` field set.
     Groups issues by the `detail` field (motor/device label) and computes status.
+    Only includes actual motors/devices — skips subsystem-level issues.
     """
     # Skip subsystems that are purely software/system-level
-    skip_subsystems = {"ELECTRICAL", "CAN"}
+    skip_subsystems = {"ELECTRICAL", "CAN", "RADIO"}
+    # detail values that are subsystem names, not motor names
+    skip_details = set(DEFAULT_SUBSYSTEMS) | _MOTOR_SUBSYSTEMS
     by_motor: dict[str, list[Issue]] = {}
 
     for issue in all_issues:
         if issue.subsystem in skip_subsystems:
             continue
         if not issue.detail:
+            continue
+        if issue.detail in skip_details:
             continue
         label = issue.detail
         if label not in by_motor:
