@@ -1,6 +1,5 @@
 # FRC Robot Log Analyzer
 
-![Swerve issue log analysis](images/swervelog.png)
 ![Miscellaneous issues log analysis](images/miscissues.png)
 
 This is 95% vibe coded, 5% hand coded, as a proof of concept for cross-referencing FRC robot logs and checking for errors. It is based upon 8592's 2026 robot, which has a swerve, intake, dye rotor, feeder wheels, turret, fly wheel, rear flywheels, and some misc things. Don't squint too hard at the code - a lot of it is hard coded and specific to our bot.
@@ -348,3 +347,6 @@ When `.hoot` files are analyzed, they are converted to `.wpilog` via CTRE's `owl
 ```bash
 python3 analyze.py -d logs/ -t 2026-03-24_23-38 --clean
 ```
+# Sample log outputs
+## Swerve azimuth motor power wire came loose
+![Swerve issue log analysis](images/swervelog.png)
