@@ -1,4 +1,10 @@
-# AdvantageKit Log Analyzer
+# FRC Robot Log Analyzer
+
+![Miscellaneous issues log analysis](images/miscissues.png)
+
+This is 95% vibe coded, 5% hand coded, as a proof of concept for cross-referencing FRC robot logs and checking for errors. It is based upon 8592's 2026 robot, which has a swerve, intake, dye rotor, feeder wheels, turret, fly wheel, rear flywheels, and some misc things. Don't squint too hard at the code - a lot of it is hard coded and specific to our bot.
+
+Ideally, from this, the community can create a 'spec', 'list of features', etc for what a really good and generic log analyzer looks like. We can then take bits of code from this project to make a proper universal tool.
 
 Command-line tool for analyzing FRC robot log files. Parses AdvantageKit `.wpilog`, REV Robotics `.revlog`, and CTRE Phoenix 6 `.hoot` files to surface electrical, mechanical, and motor controller issues.
 
@@ -9,6 +15,62 @@ Command-line tool for analyzing FRC robot log files. Parses AdvantageKit `.wpilo
 | `.wpilog` | AdvantageKit / WPILib DataLog | Native Python (`parser.py`) |
 | `.revlog` | REV Robotics StatusLogger (SPARK MAX/FLEX) | Native Python (`revlog_parser.py`) |
 | `.hoot` | CTRE Phoenix 6 Signal Logger (TalonFX, CANcoder, Pigeon2) | Via `owlet` CLI (`hoot_converter.py`) |
+
+## Timestamps and Game Mode
+
+### Timestamp sources
+
+Each log format uses a different clock:
+
+| Format | Clock source | Epoch |
+|---|---|---|
+| `.wpilog` | roboRIO FPGA clock | Relative to robot boot (starts ~1.7s) |
+| `.revlog` | CAN RX timestamp (milliseconds) | Relative to REVLib StatusLogger start |
+| `.hoot` | Unix epoch (microseconds) | Converted to session-relative, then synced to wpilog |
+
+### Automatic timestamp synchronization (hoot ↔ wpilog)
+
+When both `.hoot` and `.wpilog` files are analyzed together, the analyzer automatically synchronizes their timestamps using the `RobotEnable` signal logged by CTRE TalonFX devices.
+
+The sync process:
+1. Finds enable/disable transitions in the wpilog (`DriverStation/Enabled`)
+2. Finds `RobotEnable` transitions in the hoot data (logged by the TalonFX itself)
+3. Matches the first enable transition after a long disabled period in both sources
+4. Computes a time offset from that pair
+5. Verifies the offset against subsequent transitions — all must match within 1 second
+6. If verified, applies the offset to all hoot timestamps
+
+The sync status is printed to stderr on each run, e.g.:
+```
+Timestamp sync: hoot offset = +7.45s (verified 3/3 transitions, avg error 0.019s)
+```
+
+If sync fails (no `RobotEnable` data, or transitions don't match), hoot timestamps remain session-relative and a warning is printed.
+
+### Unsynchronized sources
+
+`.revlog` timestamps are not currently synced. The REV StatusLogger uses CAN RX timestamps which are typically close to the FPGA clock, so `.revlog` and `.wpilog` timestamps may already be approximately aligned — but this is not guaranteed and no automatic correction is applied.
+
+### Game mode detection
+
+Game mode (`DISABLED`, `AUTO`, `TELEOP`) is determined **only from the `.wpilog` file**, using two DriverStation channels:
+
+- `/DriverStation/Enabled` (boolean) — whether the robot is enabled
+- `/DriverStation/Autonomous` (boolean) — whether autonomous mode is active
+
+The mode at any point in time is:
+- **DISABLED** — `Enabled = False`
+- **AUTO** — `Enabled = True` and `Autonomous = True`
+- **TELEOP** — `Enabled = True` and `Autonomous = False`
+
+### Match time vs session time
+
+The analyzer distinguishes between FMS matches and practice sessions:
+
+- **FMS match** — the first enabled mode is AUTO (standard sequence: DISABLED → AUTO → DISABLED → TELEOP → DISABLED). Issue timestamps show match-relative time: `[AUTO 0:12]`, `[TELEOP 2:30]`.
+- **Practice session** — the first enabled mode is TELEOP. Issue timestamps show session-relative time: `[TELEOP T+0:40]`, `[DISABLED T+2:30]`.
+
+When `.revlog` or `.hoot` data is analyzed alongside a `.wpilog`, the game mode prefix on each issue is determined by looking up that issue's timestamp in the wpilog's game mode timeline. If no `.wpilog` is provided, issues from `.revlog` and `.hoot` files are reported without a game mode prefix.
 
 ## Dependencies
 
@@ -88,7 +150,7 @@ Adds subsystem routing and motor group comparison:
 }
 ```
 
-**`subsystems`** — Declares subsystem names that should appear in the report table. These are merged with the defaults (`ELECTRICAL`, `SHOOTER`, `INTAKE`, `TURRET`, `SWERVE`, `CAN`, `REVLOG`, `HOOT`). Without this, CTRE and REV device issues all land under `HOOT` or `REVLOG` since those log formats have no concept of which subsystem a motor belongs to.
+**`subsystems`** — Declares subsystem names that should appear in the report table. These are merged with the defaults (`ELECTRICAL`, `RADIO`, `SHOOTER`, `INTAKE`, `TURRET`, `SWERVE`, `CAN`, `MOTORS`). Without this, CTRE and REV device issues all land under `MOTORS` since those log formats have no concept of which subsystem a motor belongs to.
 
 **`devices`** — Maps device keys to a name and subsystem. When a device has a subsystem assignment, all issues from that device (faults, voltage sags, current spikes, etc.) appear under that subsystem instead of the generic `HOOT`/`REVLOG`.
 
@@ -119,6 +181,8 @@ Motor group fields:
 
 Thresholds are defined as constants at the top of each analyzer module:
 
+**Electrical / Motor power:**
+
 | File | Threshold | Default |
 |---|---|---|
 | `analyzers/electrical.py` | Low battery voltage | < 11.0 V for > 1 s |
@@ -133,6 +197,18 @@ Thresholds are defined as constants at the top of each analyzer module:
 | `analyzers/hoot.py` | Power starved (per device) | < 7.0 V for > 5 s |
 | `analyzers/hoot.py` | Supply voltage sag (per device) | < 10.0 V for > 0.5 s |
 | `analyzers/hoot.py` | Stator current spike | > 80 A for > 0.5 s |
+| `analyzers/hoot.py` | Motor output lost | > 5V to 0V, stays at 0 for 5+ samples |
+
+**Radio / Communications:**
+
+| File | Check | ERR | WARN | INFO |
+|---|---|---|---|---|
+| `analyzers/radio.py` | Signal strength (dBm) | ≤ -70 | -60 to -70 | -50 to -60 |
+| `analyzers/radio.py` | Signal-to-noise ratio (dB) | ≤ 20 | 20–30 | — |
+| `analyzers/radio.py` | Link rate RX/TX (Mbps) | ≤ 50 | 50–200 | — |
+| `analyzers/radio.py` | Connection quality | — | below "good" | — |
+| `analyzers/radio.py` | Comms dropout burst | ≥ 5 events | 2–4 events | 1 event |
+| `analyzers/radio.py` | Radio disconnect | while enabled | while disabled | — |
 
 ### Voltage sag severity levels
 
@@ -239,6 +315,7 @@ python3 analyze.py --hoot canivore.hoot rio.hoot
 -i, --info             Show all issues (info, warnings, errors) in detail sections
 -v, --verbose          Show all decoded channels
 -b, --batch DIR        Batch-analyze all .wpilog files in a directory
+    --clean            Remove temporary files (*_converted.wpilog) after analysis
 ```
 
 ### Filter to one subsystem
@@ -247,7 +324,7 @@ python3 analyze.py --hoot canivore.hoot rio.hoot
 python3 analyze.py -d logs/ -t 2026-03-24_23-38 -s HOOT
 ```
 
-Available subsystems: `ELECTRICAL`, `SHOOTER`, `INTAKE`, `TURRET`, `SWERVE`, `CAN`, `REVLOG`, `HOOT`
+Available subsystems: `ELECTRICAL`, `RADIO`, `SHOOTER`, `INTAKE`, `TURRET`, `SWERVE`, `CAN`, `MOTORS` (plus any user-defined subsystems from `can_map.json`)
 
 ### Show all decoded channels
 
@@ -262,3 +339,14 @@ Analyze all `.wpilog` files in a directory and print a one-line summary for each
 ```bash
 python3 analyze.py --batch path/to/logs/
 ```
+
+### Cleanup temporary files
+
+When `.hoot` files are analyzed, they are converted to `.wpilog` via CTRE's `owlet` tool and cached alongside the originals. Use `--clean` to remove these after analysis:
+
+```bash
+python3 analyze.py -d logs/ -t 2026-03-24_23-38 --clean
+```
+# Sample log outputs
+## Swerve azimuth motor power wire came loose
+![Swerve issue log analysis](images/swervelog.png)

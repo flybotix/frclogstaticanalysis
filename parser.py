@@ -70,6 +70,14 @@ def _decode_value(payload: bytes, type_str: str) -> Any:
             vx, vy, omega = struct.unpack_from("<ddd", payload)
             return {"vx": vx, "vy": vy, "omega": omega}
         return None
+    if type_str == "json":
+        if not payload:
+            return None
+        try:
+            import json
+            return json.loads(payload.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
     # Unknown type — return raw bytes length as a hint
     return None
 
