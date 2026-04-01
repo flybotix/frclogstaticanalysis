@@ -5,12 +5,14 @@ Detects issues from CTRE device telemetry (TalonFX, CANcoder, Pigeon2, CANdle):
   - TalonFX: hardware faults, undervoltage, over-temperature, stator current spikes,
     boot-during-enable, stall current limiting
   - CANcoder: bad magnet, hardware faults
-  - Pigeon2: hardware faults, sensor saturation
+  - Pigeon2: hardware faults, sensor saturation, gyro drift, collisions/impacts,
+    tilt/tip detection, thermal drift, magnetometer interference, supply voltage,
+    no-motion validation
   - CANdle: short circuit, thermal faults
   - All devices: sticky fault summary at startup
 """
 
-from signals import get, find_channels, find_threshold_spans, fmt_time
+from signals import get, find_channels, find_threshold_spans, find_drops, derivative, fmt_time
 from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO
 from device_config import DeviceConfig
 from parser import get_game_mode_at, MODE_DISABLED
@@ -53,6 +55,21 @@ _SUPPLY_VOLTAGE_STARVED = 7.0
 _SUPPLY_VOLTAGE_STARVED_DUR = 5.0
 _STATOR_CURRENT_WARN = 80.0
 _STATOR_CURRENT_DUR = 0.5
+
+# Pigeon2 thresholds
+_PIGEON_YAW_DRIFT_DEG_S = 0.5        # yaw rate while stationary (deg/s)
+_PIGEON_YAW_DRIFT_MIN_DUR = 3.0      # must persist to filter noise
+_PIGEON_ACCEL_IMPACT_G = 1.99        # collision detection (g)
+_PIGEON_ACCEL_WARN_G = 1.5           # hard-stop warning (g)
+_PIGEON_TILT_ERR_DEG = 15.0          # severe tilt
+_PIGEON_TILT_WARN_DEG = 10.0         # moderate tilt
+_PIGEON_TILT_MIN_DUR = 0.5           # tilt must persist
+_PIGEON_TEMP_WARN_C = 50.0           # IMU temperature warning
+_PIGEON_TEMP_MIN_DUR = 5.0
+_PIGEON_MAG_FIELD_WARN_UT = 100.0    # magnetic interference threshold (µT)
+_PIGEON_MAG_FIELD_MIN_DUR = 1.0
+_PIGEON_SUPPLY_VOLTAGE_WARN = 10.0   # Pigeon supply voltage sag
+_PIGEON_SUPPLY_VOLTAGE_DUR = 0.5
 
 
 def _get_devices(channels: dict) -> dict[str, list[str]]:
@@ -210,7 +227,7 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
                                   for s, e, _ in starved)
                     if not already:
                         duration = end - start
-                        if duration > 1.0 or peak < 7.0:
+                        if duration > 2.0 or peak < 7.0:
                             sev = SEVERITY_ERR
                         elif peak < 9.0:
                             sev = SEVERITY_WARN
@@ -344,5 +361,223 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
                     message=f"{label} magnet health: {bad[0][1]} at {fmt_time(bad[0][0])}",
                     time_start=bad[0][0], detail=detail,
                 ))
+
+        # --- Pigeon2-specific checks ---
+        if device_type == "Pigeon2":
+
+            # -- Gyro drift detection --
+            # Look for yaw changing while the Pigeon reports no motion
+            yaw_series = get(channels, f"{prefix}/Yaw")
+            no_motion_series = get(channels, f"{prefix}/NoMotionCount")
+            if yaw_series and no_motion_series:
+                yaw_rate = derivative(yaw_series)
+                # Build a set of times when NoMotionCount > 0 (robot stationary)
+                stationary_times = {round(t, 2) for t, v in no_motion_series if v > 0}
+                # Yaw rate while stationary
+                drift_series = [(t, abs(v)) for t, v in yaw_rate
+                                if round(t, 2) in stationary_times]
+                drift_spans = find_threshold_spans(
+                    drift_series, _PIGEON_YAW_DRIFT_DEG_S,
+                    _PIGEON_YAW_DRIFT_MIN_DUR, above=True)
+                for start, end, peak in drift_spans:
+                    issues.append(Issue(
+                        severity=SEVERITY_WARN,
+                        subsystem=subsystem,
+                        message=f"{label} gyro drift while stationary "
+                                f"{fmt_time(start)}–{fmt_time(end)} "
+                                f"({end - start:.1f}s), peak {peak:.2f}°/s — "
+                                f"check calibration or thermal stability",
+                        time_start=start, time_end=end,
+                    ))
+
+            # -- Accumulated gyro drift --
+            # Large accumulated gyro Z change while stationary indicates integration error
+            accum_z = get(channels, f"{prefix}/AccumGyroZ")
+            if accum_z and len(accum_z) > 1:
+                total_drift = abs(accum_z[-1][1] - accum_z[0][1])
+                log_dur = accum_z[-1][0] - accum_z[0][0]
+                if log_dur > 10.0:
+                    drift_rate = total_drift / log_dur
+                    if drift_rate > _PIGEON_YAW_DRIFT_DEG_S:
+                        issues.append(Issue(
+                            severity=SEVERITY_WARN,
+                            subsystem=subsystem,
+                            message=f"{label} accumulated gyro Z drift: "
+                                    f"{total_drift:.1f}° over {log_dur:.0f}s "
+                                    f"({drift_rate:.2f}°/s avg)",
+                            time_start=accum_z[0][0], time_end=accum_z[-1][0],
+                        ))
+
+            # -- Collision / impact detection --
+            # Collect all impact/bump events across axes, then group into bursts
+            all_impacts = []   # (time, peak_g, axis, severity)
+            for axis in ("X", "Y", "Z"):
+                accel_series = get(channels, f"{prefix}/Acceleration{axis}")
+                if not accel_series:
+                    continue
+                # Z axis has ~1g from gravity, so subtract it
+                if axis == "Z":
+                    accel_series = [(t, abs(v) - 1.0) for t, v in accel_series]
+                else:
+                    accel_series = [(t, abs(v)) for t, v in accel_series]
+
+                severe = find_threshold_spans(
+                    accel_series, _PIGEON_ACCEL_IMPACT_G, 0.0, above=True)
+                for start, end, peak in severe:
+                    all_impacts.append((start, peak, axis, SEVERITY_ERR))
+
+                moderate = find_threshold_spans(
+                    accel_series, _PIGEON_ACCEL_WARN_G, 0.0, above=True)
+                for start, end, peak in moderate:
+                    # Skip if already captured as severe
+                    already_severe = any(abs(start - s) < 0.05
+                                         for s, _, _, sev in all_impacts
+                                         if sev == SEVERITY_ERR)
+                    if already_severe:
+                        continue
+                    all_impacts.append((start, peak, axis, SEVERITY_WARN))
+
+            # Group impacts into bursts (gap > 2s = new burst)
+            if all_impacts:
+                all_impacts.sort(key=lambda x: x[0])
+                bursts = []
+                cur_burst = [all_impacts[0]]
+                for evt in all_impacts[1:]:
+                    if evt[0] - cur_burst[-1][0] > 2.0:
+                        bursts.append(cur_burst)
+                        cur_burst = [evt]
+                    else:
+                        cur_burst.append(evt)
+                bursts.append(cur_burst)
+
+                for burst in bursts:
+                    t_start = burst[0][0]
+                    t_end = burst[-1][0]
+                    peak_g = max(e[1] for e in burst)
+                    axes = sorted(set(e[2] for e in burst))
+                    has_severe = any(e[3] == SEVERITY_ERR for e in burst)
+                    sev = SEVERITY_ERR if has_severe else SEVERITY_WARN
+                    count = len(burst)
+                    ax_str = "/".join(axes)
+                    if count == 1:
+                        msg = (f"{label} {'IMPACT' if has_severe else 'hard stop/bump'} "
+                               f"({ax_str}) at {fmt_time(t_start)}, "
+                               f"peak {peak_g:.2f}g")
+                    else:
+                        msg = (f"{label} {'IMPACTS' if has_severe else 'hard stops/bumps'} "
+                               f"({ax_str}) {fmt_time(t_start)}–{fmt_time(t_end)}, "
+                               f"×{count} events, peak {peak_g:.2f}g")
+                    issues.append(Issue(
+                        severity=sev,
+                        subsystem=subsystem,
+                        message=msg,
+                        time_start=t_start, time_end=t_end,
+                    ))
+
+            # -- Tilt / tip detection --
+            pitch_series = get(channels, f"{prefix}/Pitch")
+            roll_series = get(channels, f"{prefix}/Roll")
+            for angle_name, angle_series in [("pitch", pitch_series), ("roll", roll_series)]:
+                if not angle_series:
+                    continue
+                abs_angle = [(t, abs(v)) for t, v in angle_series]
+
+                # ERR: severe tilt
+                severe = find_threshold_spans(
+                    abs_angle, _PIGEON_TILT_ERR_DEG,
+                    _PIGEON_TILT_MIN_DUR, above=True)
+                for start, end, peak in severe:
+                    issues.append(Issue(
+                        severity=SEVERITY_ERR,
+                        subsystem=subsystem,
+                        message=f"{label} severe {angle_name} tilt "
+                                f"{fmt_time(start)}–{fmt_time(end)} "
+                                f"({end - start:.1f}s), peak {peak:.1f}°",
+                        time_start=start, time_end=end,
+                    ))
+
+                # WARN: moderate tilt (skip spans already covered by severe)
+                moderate = find_threshold_spans(
+                    abs_angle, _PIGEON_TILT_WARN_DEG,
+                    _PIGEON_TILT_MIN_DUR, above=True)
+                for start, end, peak in moderate:
+                    already = any(s <= start and end <= e + 0.5
+                                  for s, e, _ in severe)
+                    if not already:
+                        issues.append(Issue(
+                            severity=SEVERITY_WARN,
+                            subsystem=subsystem,
+                            message=f"{label} {angle_name} tilt "
+                                    f"{fmt_time(start)}–{fmt_time(end)} "
+                                    f"({end - start:.1f}s), peak {peak:.1f}°",
+                            time_start=start, time_end=end,
+                        ))
+
+            # -- Temperature monitoring --
+            temp_series = get(channels, f"{prefix}/Temperature")
+            if temp_series:
+                hot = find_threshold_spans(
+                    temp_series, _PIGEON_TEMP_WARN_C,
+                    _PIGEON_TEMP_MIN_DUR, above=True)
+                for start, end, peak in hot:
+                    issues.append(Issue(
+                        severity=SEVERITY_WARN,
+                        subsystem=subsystem,
+                        message=f"{label} IMU over-temperature "
+                                f"{fmt_time(start)}–{fmt_time(end)} "
+                                f"({end - start:.1f}s), peak {peak:.0f}°C — "
+                                f"gyro accuracy degrades with heat",
+                        time_start=start, time_end=end,
+                    ))
+
+            # -- Magnetometer interference --
+            for axis in ("X", "Y", "Z"):
+                mag_series = get(channels, f"{prefix}/RawMagneticField{axis}")
+                if not mag_series:
+                    continue
+                abs_mag = [(t, abs(v)) for t, v in mag_series]
+                interference = find_threshold_spans(
+                    abs_mag, _PIGEON_MAG_FIELD_WARN_UT,
+                    _PIGEON_MAG_FIELD_MIN_DUR, above=True)
+                for start, end, peak in interference:
+                    issues.append(Issue(
+                        severity=SEVERITY_WARN,
+                        subsystem=subsystem,
+                        message=f"{label} magnetic interference ({axis}) "
+                                f"{fmt_time(start)}–{fmt_time(end)} "
+                                f"({end - start:.1f}s), peak {peak:.0f} µT — "
+                                f"heading accuracy may be degraded",
+                        time_start=start, time_end=end,
+                    ))
+
+            # -- Supply voltage monitoring --
+            pigeon_supply = get(channels, f"{prefix}/SupplyVoltage")
+            if pigeon_supply:
+                sags = find_threshold_spans(
+                    pigeon_supply, _PIGEON_SUPPLY_VOLTAGE_WARN,
+                    _PIGEON_SUPPLY_VOLTAGE_DUR, above=False)
+                for start, end, peak in sags:
+                    issues.append(Issue(
+                        severity=SEVERITY_WARN,
+                        subsystem=subsystem,
+                        message=f"{label} supply voltage sag "
+                                f"{fmt_time(start)}–{fmt_time(end)} "
+                                f"({end - start:.1f}s), min {peak:.2f}V",
+                        time_start=start, time_end=end,
+                    ))
+
+            # -- No-motion validation --
+            # Flag if NoMotionCount stays at 0 for entire log (sensor may be misconfigured)
+            if no_motion_series:
+                ever_stationary = any(v > 0 for _, v in no_motion_series)
+                if not ever_stationary and len(no_motion_series) > 10:
+                    issues.append(Issue(
+                        severity=SEVERITY_INFO,
+                        subsystem=subsystem,
+                        message=f"{label} NoMotionCount never incremented — "
+                                f"no-motion detection may be disabled or "
+                                f"sensor is experiencing constant vibration",
+                        time_start=no_motion_series[0][0],
+                    ))
 
     return issues
