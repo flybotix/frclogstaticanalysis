@@ -209,7 +209,8 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
                     already = any(s <= start and end <= e + 1.0
                                   for s, e, _ in starved)
                     if not already:
-                        if peak < 7.0:
+                        duration = end - start
+                        if duration > 1.0 or peak < 7.0:
                             sev = SEVERITY_ERR
                         elif peak < 9.0:
                             sev = SEVERITY_WARN

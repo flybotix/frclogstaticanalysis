@@ -70,7 +70,7 @@ def analyze_radio(channels: dict) -> list[Issue]:
             t_cur, v_cur = radio_connected[i]
             if v_prev and not v_cur:
                 mode = get_game_mode_at(transitions, t_cur)
-                sev = SEVERITY_ERR if mode != MODE_DISABLED else SEVERITY_WARN
+                sev = SEVERITY_ERR if mode != MODE_DISABLED else SEVERITY_INFO
                 issues.append(Issue(
                     severity=sev,
                     subsystem=SUBSYSTEM,
@@ -107,22 +107,23 @@ def analyze_radio(channels: dict) -> list[Issue]:
         for start, end, count in bursts:
             mode = get_game_mode_at(transitions, start)
             dur = end - start
-            if count >= 5:
+            if mode == MODE_DISABLED:
+                sev = SEVERITY_INFO
+            elif count >= 5:
                 sev = SEVERITY_ERR
             elif count >= 2:
                 sev = SEVERITY_WARN
             else:
                 sev = SEVERITY_INFO
 
-            if mode != MODE_DISABLED or sev != SEVERITY_INFO:
-                issues.append(Issue(
-                    severity=sev,
-                    subsystem=SUBSYSTEM,
-                    message=(f"Comms dropout ×{count} at {fmt_time(start)}"
-                             f" ({dur:.1f}s burst)"),
-                    time_start=start,
-                    time_end=end,
-                ))
+            issues.append(Issue(
+                severity=sev,
+                subsystem=SUBSYSTEM,
+                message=(f"Comms dropout ×{count} at {fmt_time(start)}"
+                         f" ({dur:.1f}s burst)"),
+                time_start=start,
+                time_end=end,
+            ))
 
     # --- Radio signal quality from RadioStatus/Status JSON ---
     radio_signals = _extract_radio_signals(channels)
@@ -199,6 +200,13 @@ def _analyze_joystick_gaps(channels, transitions, issues):
             ))
 
 
+def _sev_for_mode(sev, transitions, t):
+    """Demote severity to INFO if the timestamp falls in DISABLED game mode."""
+    if transitions and get_game_mode_at(transitions, t) == MODE_DISABLED:
+        return SEVERITY_INFO
+    return sev
+
+
 def _analyze_signal_quality(radio_signals, transitions, issues):
     """Analyze signal strength, SNR, and link rates from radio JSON."""
 
@@ -208,11 +216,12 @@ def _analyze_signal_quality(radio_signals, transitions, issues):
 
     if not linked:
         if unlinked:
+            t0 = unlinked[0][0]
             issues.append(Issue(
-                severity=SEVERITY_ERR,
+                severity=_sev_for_mode(SEVERITY_ERR, transitions, t0),
                 subsystem=SUBSYSTEM,
                 message=f"Radio never linked during session ({len(unlinked)} samples)",
-                time_start=unlinked[0][0],
+                time_start=t0,
             ))
         return
 
@@ -227,22 +236,24 @@ def _analyze_signal_quality(radio_signals, transitions, issues):
         info_spans = [(t, v) for t, v in signal_series if _SIGNAL_WARN_DBM < v <= _SIGNAL_INFO_DBM]
 
         if err_spans:
+            t0 = err_spans[0][0]
             issues.append(Issue(
-                severity=SEVERITY_ERR,
+                severity=_sev_for_mode(SEVERITY_ERR, transitions, t0),
                 subsystem=SUBSYSTEM,
                 message=(f"Weak signal ×{len(err_spans)} samples "
                          f"(≤{_SIGNAL_ERR_DBM} dBm), "
-                         f"worst {worst_signal} dBm at {fmt_time(err_spans[0][0])}"),
-                time_start=err_spans[0][0],
+                         f"worst {worst_signal} dBm at {fmt_time(t0)}"),
+                time_start=t0,
             ))
         elif warn_spans:
+            t0 = warn_spans[0][0]
             issues.append(Issue(
-                severity=SEVERITY_WARN,
+                severity=_sev_for_mode(SEVERITY_WARN, transitions, t0),
                 subsystem=SUBSYSTEM,
                 message=(f"Marginal signal ×{len(warn_spans)} samples "
                          f"({_SIGNAL_ERR_DBM} to {_SIGNAL_WARN_DBM} dBm), "
                          f"worst {worst_signal} dBm"),
-                time_start=warn_spans[0][0],
+                time_start=t0,
             ))
         elif info_spans:
             issues.append(Issue(
@@ -263,21 +274,23 @@ def _analyze_signal_quality(radio_signals, transitions, issues):
         warn_snr = [(t, v) for t, v in snr_series if _SNR_ERR < v <= _SNR_WARN]
 
         if err_snr:
+            t0 = err_snr[0][0]
             issues.append(Issue(
-                severity=SEVERITY_ERR,
+                severity=_sev_for_mode(SEVERITY_ERR, transitions, t0),
                 subsystem=SUBSYSTEM,
                 message=(f"Low SNR ×{len(err_snr)} samples "
                          f"(≤{_SNR_ERR} dB), worst {worst_snr} dB "
-                         f"at {fmt_time(err_snr[0][0])} — expect packet loss"),
-                time_start=err_snr[0][0],
+                         f"at {fmt_time(t0)} — expect packet loss"),
+                time_start=t0,
             ))
         elif warn_snr:
+            t0 = warn_snr[0][0]
             issues.append(Issue(
-                severity=SEVERITY_WARN,
+                severity=_sev_for_mode(SEVERITY_WARN, transitions, t0),
                 subsystem=SUBSYSTEM,
                 message=(f"Marginal SNR ×{len(warn_snr)} samples "
                          f"({_SNR_ERR}–{_SNR_WARN} dB), worst {worst_snr} dB"),
-                time_start=warn_snr[0][0],
+                time_start=t0,
             ))
 
     # --- Link rate ---
@@ -293,34 +306,37 @@ def _analyze_signal_quality(radio_signals, transitions, issues):
         warn_rate = [(t, v) for t, v in series if _LINKRATE_ERR < v <= _LINKRATE_WARN]
 
         if err_rate:
+            t0 = err_rate[0][0]
             issues.append(Issue(
-                severity=SEVERITY_ERR,
+                severity=_sev_for_mode(SEVERITY_ERR, transitions, t0),
                 subsystem=SUBSYSTEM,
                 message=(f"Low {label} link rate ×{len(err_rate)} samples "
                          f"(≤{_LINKRATE_ERR} Mbps), "
-                         f"worst {worst_rate:.0f} Mbps at {fmt_time(err_rate[0][0])}"),
-                time_start=err_rate[0][0],
+                         f"worst {worst_rate:.0f} Mbps at {fmt_time(t0)}"),
+                time_start=t0,
             ))
         elif warn_rate:
+            t0 = warn_rate[0][0]
             issues.append(Issue(
-                severity=SEVERITY_WARN,
+                severity=_sev_for_mode(SEVERITY_WARN, transitions, t0),
                 subsystem=SUBSYSTEM,
                 message=(f"Degraded {label} link rate ×{len(warn_rate)} samples "
                          f"({_LINKRATE_ERR}–{_LINKRATE_WARN} Mbps), "
                          f"worst {worst_rate:.0f} Mbps"),
-                time_start=warn_rate[0][0],
+                time_start=t0,
             ))
 
     # --- Connection quality changes ---
     qualities = [(t, s["quality"]) for t, s in linked if s["quality"]]
     bad_quality = [(t, q) for t, q in qualities if q not in ("excellent", "good")]
     if bad_quality:
+        t0 = bad_quality[0][0]
         worst_q = bad_quality[0][1]
         issues.append(Issue(
-            severity=SEVERITY_WARN,
+            severity=_sev_for_mode(SEVERITY_WARN, transitions, t0),
             subsystem=SUBSYSTEM,
             message=(f"Connection quality degraded to \"{worst_q}\" "
-                     f"at {fmt_time(bad_quality[0][0])} "
+                     f"at {fmt_time(t0)} "
                      f"({len(bad_quality)} samples below \"good\")"),
-            time_start=bad_quality[0][0],
+            time_start=t0,
         ))
