@@ -6,13 +6,15 @@ Supports two can_map.json formats:
 Legacy (flat):
   {"PDH:0": "Front Left Drive", "SPARK:16": "FL SPARK"}
 
-Extended (with subsystems and motor groups):
+Extended (with subsystems, motor groups, and control modes):
   {
     "subsystems": ["ELEVATOR", "INTAKE"],
     "devices": {
-      "CTRE:TalonFX-29": {"name": "Elevator Left", "subsystem": "ELEVATOR"},
-      "SPARK:16":         {"name": "Indexer",        "subsystem": "SHOOTER"},
-      "PDH:0":            {"name": "FL Drive",       "subsystem": "SWERVE"}
+      "CTRE:TalonFX-29": {"name": "Elevator Left", "subsystem": "ELEVATOR",
+                           "control_mode": "position"},
+      "CTRE:TalonFX-3":  {"name": "FL Drive",      "subsystem": "SWERVE",
+                           "control_mode": "velocity"},
+      "SPARK:16":         {"name": "Indexer",        "subsystem": "SHOOTER"}
     },
     "motor_groups": [
       {
@@ -25,6 +27,14 @@ Extended (with subsystems and motor groups):
     ]
   }
 
+Valid control_mode values:
+  - "position"          Position closed-loop (PID following error is monitored)
+  - "velocity"          Velocity closed-loop (position error is ignored)
+  - "motion_profile"    Motion profiling (position error is monitored)
+
+If control_mode is omitted, position following error checks are skipped for
+that device (conservative default to avoid false positives).
+
 Both formats can coexist — flat keys are treated as legacy device names
 with no subsystem assignment.
 """
@@ -32,11 +42,18 @@ with no subsystem assignment.
 from dataclasses import dataclass, field
 
 
+CONTROL_MODE_POSITION = "position"
+CONTROL_MODE_VELOCITY = "velocity"
+CONTROL_MODE_MOTION_PROFILE = "motion_profile"
+_VALID_CONTROL_MODES = {CONTROL_MODE_POSITION, CONTROL_MODE_VELOCITY, CONTROL_MODE_MOTION_PROFILE}
+
+
 @dataclass
 class DeviceInfo:
     key: str            # e.g. "CTRE:TalonFX-29", "SPARK:16", "PDH:0"
     name: str           # human-readable label
     subsystem: str      # subsystem to route issues to, or ""
+    control_mode: str = ""  # "position", "velocity", "motion_profile", or "" (unknown)
 
 
 @dataclass
@@ -68,6 +85,13 @@ class DeviceConfig:
             return info.subsystem
         return fallback
 
+    def control_mode(self, device_key: str) -> str:
+        """Get the control mode for a device, or '' if unknown."""
+        info = self.devices.get(device_key)
+        if info:
+            return info.control_mode
+        return ""
+
 
 def load_device_config(raw: dict) -> DeviceConfig:
     """Parse a can_map.json dict into a DeviceConfig."""
@@ -83,10 +107,14 @@ def load_device_config(raw: dict) -> DeviceConfig:
     if "devices" in raw:
         for key, val in raw["devices"].items():
             if isinstance(val, dict):
+                cm = val.get("control_mode", "").lower()
+                if cm and cm not in _VALID_CONTROL_MODES:
+                    cm = ""
                 devices[key] = DeviceInfo(
                     key=key,
                     name=val.get("name", key),
                     subsystem=val.get("subsystem", "").upper(),
+                    control_mode=cm,
                 )
             elif isinstance(val, str):
                 devices[key] = DeviceInfo(key=key, name=val, subsystem="")

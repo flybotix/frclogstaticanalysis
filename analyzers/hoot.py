@@ -14,7 +14,7 @@ Detects issues from CTRE device telemetry (TalonFX, CANcoder, Pigeon2, CANdle):
 
 from signals import get, find_channels, find_threshold_spans, find_drops, derivative, fmt_time
 from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO
-from device_config import DeviceConfig
+from device_config import DeviceConfig, CONTROL_MODE_POSITION, CONTROL_MODE_MOTION_PROFILE
 from parser import get_game_mode_at, MODE_DISABLED
 
 DEFAULT_SUBSYSTEM = "HOOT"
@@ -349,6 +349,110 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
                                  f"controller cannot hold motor position"),
                         time_start=brake_active[0][0], detail=detail,
                     ))
+
+            # Limit switch engagement
+            for direction in ("Forward", "Reverse"):
+                limit_series = channels.get(f"{prefix}/{direction}Limit", [])
+                if not limit_series:
+                    continue
+                closed_events = [(t, v) for t, v in limit_series
+                                 if isinstance(v, str) and v == "Closed"]
+                if closed_events:
+                    # Group into spans (gap > 1s = new event)
+                    spans = []
+                    span_start = closed_events[0][0]
+                    prev_t = span_start
+                    for t, _ in closed_events[1:]:
+                        if t - prev_t > 1.0:
+                            spans.append((span_start, prev_t))
+                            span_start = t
+                        prev_t = t
+                    spans.append((span_start, prev_t))
+
+                    for start, end in spans:
+                        dur = end - start
+                        if dur > 0.1:
+                            issues.append(Issue(
+                                severity=SEVERITY_INFO,
+                                subsystem=subsystem,
+                                message=f"{label} {direction.lower()} limit switch engaged "
+                                        f"{fmt_time(start)}–{fmt_time(end)} ({dur:.1f}s)",
+                                time_start=start, time_end=end, detail=detail,
+                            ))
+                        else:
+                            issues.append(Issue(
+                                severity=SEVERITY_INFO,
+                                subsystem=subsystem,
+                                message=f"{label} {direction.lower()} limit switch hit "
+                                        f"at {fmt_time(start)}",
+                                time_start=start, detail=detail,
+                            ))
+
+            # Duty cycle saturation: motor maxed out at ±1.0
+            _DUTY_SAT_THRESH = 0.98
+            _DUTY_SAT_MIN_DUR = 1.0
+            duty_series = get(channels, f"{prefix}/DutyCycle")
+            if duty_series:
+                abs_duty = [(t, abs(v)) for t, v in duty_series]
+                sat_spans = find_threshold_spans(
+                    abs_duty, _DUTY_SAT_THRESH, _DUTY_SAT_MIN_DUR, above=True)
+                for start, end, peak in sat_spans:
+                    # Only flag if the motor was actually enabled (ignore disabled periods)
+                    if game_timeline:
+                        mode = get_game_mode_at(game_timeline, start)
+                        if mode == MODE_DISABLED:
+                            continue
+                    issues.append(Issue(
+                        severity=SEVERITY_WARN,
+                        subsystem=subsystem,
+                        message=f"{label} duty cycle saturated "
+                                f"{fmt_time(start)}–{fmt_time(end)} "
+                                f"({end - start:.1f}s) — motor at full output",
+                        time_start=start, time_end=end, detail=detail,
+                    ))
+
+            # Motor position following error (closed-loop)
+            # Only check for devices configured as position or motion_profile control.
+            # Velocity-controlled motors report meaningless position errors.
+            _POS_ERROR_WARN = 0.5     # rotations
+            _POS_ERROR_ERR = 2.0      # rotations
+            _POS_ERROR_MIN_DUR = 0.5
+            device_control_mode = config.control_mode(key) if config else ""
+            if device_control_mode in (CONTROL_MODE_POSITION, CONTROL_MODE_MOTION_PROFILE):
+                pos_error = get(channels, f"{prefix}/PIDPosition_ClosedLoopError")
+                if pos_error:
+                    abs_error = [(t, abs(v)) for t, v in pos_error]
+                    active_error = [(t, v) for t, v in abs_error if v > 0.01]
+                    if active_error:
+                        err_spans = find_threshold_spans(
+                            active_error, _POS_ERROR_ERR,
+                            _POS_ERROR_MIN_DUR, above=True)
+                        for start, end, peak in err_spans:
+                            issues.append(Issue(
+                                severity=SEVERITY_ERR,
+                                subsystem=subsystem,
+                                message=f"{label} position following error "
+                                        f"{fmt_time(start)}–{fmt_time(end)} "
+                                        f"({end - start:.1f}s), peak {peak:.2f} rot — "
+                                        f"mechanism may be jammed or obstructed",
+                                time_start=start, time_end=end, detail=detail,
+                            ))
+
+                        warn_spans = find_threshold_spans(
+                            active_error, _POS_ERROR_WARN,
+                            _POS_ERROR_MIN_DUR, above=True)
+                        for start, end, peak in warn_spans:
+                            already = any(s <= start and end <= e + 0.5
+                                          for s, e, _ in err_spans)
+                            if not already:
+                                issues.append(Issue(
+                                    severity=SEVERITY_WARN,
+                                    subsystem=subsystem,
+                                    message=f"{label} position following error "
+                                            f"{fmt_time(start)}–{fmt_time(end)} "
+                                            f"({end - start:.1f}s), peak {peak:.2f} rot",
+                                    time_start=start, time_end=end, detail=detail,
+                                ))
 
         # --- CANcoder-specific checks ---
         if device_type == "CANcoder":

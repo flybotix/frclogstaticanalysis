@@ -1,9 +1,13 @@
 """
 Mechanical issue detection:
   - Shooter velocity error (flywheel / backwheel)
+  - Shooter tracking error (firing while off-target)
   - Intake motor stall
+  - Intake roller imbalance (left vs right divergence)
   - Turret position drift
   - Swerve heading error, translation drift, pose jumps
+  - Indexer jam detection
+  - Vision system dropout
 """
 
 import math
@@ -12,7 +16,7 @@ from signals import (
     subtract, abs_series, derivative, is_near_zero, find_pose_jumps,
     fmt_time, fmt_duration
 )
-from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN
+from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO
 
 
 def _motor_label(channel_name: str, can_map: dict) -> str:
@@ -360,5 +364,173 @@ def analyze_mechanical(channels: dict, can_map: dict = None) -> list[Issue]:
                 time_start=t,
                 detail="SWERVE",
             ))
+
+    # ------------------------------------------------------------------ VISION
+    # Detect vision system dropouts — gaps in VisionPose data while robot is enabled
+    vision_pose_raw = channels.get("/RealOutputs/CustomLogs/Vision/VisionPose", [])
+    if vision_pose_raw and len(vision_pose_raw) > 10:
+        # Find gaps > 1 second in vision data
+        _VISION_GAP_WARN = 1.0
+        _VISION_GAP_ERR = 3.0
+        for i in range(1, len(vision_pose_raw)):
+            t_prev = vision_pose_raw[i - 1][0]
+            t_cur = vision_pose_raw[i][0]
+            gap = t_cur - t_prev
+            if gap >= _VISION_GAP_ERR:
+                issues.append(Issue(
+                    severity=SEVERITY_ERR,
+                    subsystem="SWERVE",
+                    message=f"Vision dropout {fmt_time(t_prev)}–{fmt_time(t_cur)} "
+                            f"({gap:.1f}s) — no AprilTag detections",
+                    time_start=t_prev, time_end=t_cur,
+                ))
+            elif gap >= _VISION_GAP_WARN:
+                issues.append(Issue(
+                    severity=SEVERITY_WARN,
+                    subsystem="SWERVE",
+                    message=f"Vision gap {fmt_time(t_prev)}–{fmt_time(t_cur)} "
+                            f"({gap:.1f}s)",
+                    time_start=t_prev, time_end=t_cur,
+                ))
+
+    # Vision ambiguity — high ambiguity means pose estimate is unreliable
+    ambiguity = get(channels, "/RealOutputs/CustomLogs/Vision/AmbiguityRatio")
+    if ambiguity:
+        _AMBIGUITY_WARN = 0.15
+        _AMBIGUITY_MIN_DUR = 0.5
+        high_ambiguity = find_threshold_spans(
+            ambiguity, _AMBIGUITY_WARN, _AMBIGUITY_MIN_DUR, above=True)
+        for start, end, peak in high_ambiguity:
+            issues.append(Issue(
+                severity=SEVERITY_WARN,
+                subsystem="SWERVE",
+                message=f"Vision high ambiguity "
+                        f"{fmt_time(start)}–{fmt_time(end)} "
+                        f"({end - start:.1f}s), peak {peak:.2f} — "
+                        f"pose estimate unreliable",
+                time_start=start, time_end=end,
+            ))
+
+    # ------------------------------------------------------------------ INDEXER
+    # Detect indexer jams: voltage/RPM commanded but actual RPM near zero
+    indexer_output = get(channels, "/RealOutputs/CustomLogs/Indexer/Output RPM")
+    indexer_spinner = get(channels, "/RealOutputs/CustomLogs/Indexer/Spinner RPM")
+    if indexer_output and indexer_spinner:
+        # Look for commanded RPM high but actual RPM near zero
+        _INDEXER_CMD_THRESH = 100.0    # commanded RPM threshold
+        _INDEXER_ACTUAL_THRESH = 20.0  # actual RPM below this = stalled
+        _INDEXER_STALL_DUR = 0.5
+
+        # Build stall series: True when output is commanding but spinner isn't moving
+        output_dict = {round(t, 3): v for t, v in indexer_output}
+        stall_series = []
+        for t, spinner_v in indexer_spinner:
+            key = round(t, 3)
+            cmd = output_dict.get(key)
+            if cmd is not None and abs(cmd) > _INDEXER_CMD_THRESH and abs(spinner_v) < _INDEXER_ACTUAL_THRESH:
+                stall_series.append((t, True))
+            else:
+                stall_series.append((t, False))
+
+        stall_spans = find_true_spans(stall_series, min_duration=_INDEXER_STALL_DUR)
+        for start, end in stall_spans:
+            issues.append(Issue(
+                severity=SEVERITY_WARN,
+                subsystem="INTAKE",
+                message=f"Indexer stall/jam "
+                        f"{fmt_time(start)}–{fmt_time(end)} "
+                        f"({end - start:.1f}s) — spinner not moving while commanded",
+                time_start=start, time_end=end,
+            ))
+
+    # --------------------------------------------------------- INTAKE IMBALANCE
+    # Detect left/right intake roller voltage divergence
+    left_volt = get(channels, "/RealOutputs/CustomLogs/Intake/Left Roller Motor Voltage")
+    right_volt = get(channels, "/RealOutputs/CustomLogs/Intake/Right Roller Motor Voltage")
+    if left_volt and right_volt:
+        _IMBALANCE_THRESH = 3.0   # voltage difference threshold
+        _IMBALANCE_MIN_DUR = 1.0
+        diff = abs_series(subtract(left_volt, right_volt))
+        # Only check when at least one roller is active (> 2V)
+        active_diff = []
+        right_dict = {round(t, 3): v for t, v in right_volt}
+        for t, d in diff:
+            key = round(t, 3)
+            left_v = next((v for ts, v in left_volt if round(ts, 3) == key), 0)
+            right_v = right_dict.get(key, 0)
+            if abs(left_v) > 2.0 or abs(right_v) > 2.0:
+                active_diff.append((t, d))
+
+        imbalance_spans = find_threshold_spans(
+            active_diff, _IMBALANCE_THRESH, _IMBALANCE_MIN_DUR, above=True)
+        for start, end, peak in imbalance_spans:
+            issues.append(Issue(
+                severity=SEVERITY_WARN,
+                subsystem="INTAKE",
+                message=f"Intake roller imbalance "
+                        f"{fmt_time(start)}–{fmt_time(end)} "
+                        f"({end - start:.1f}s), peak ΔV {peak:.1f}V — "
+                        f"left/right rollers diverging",
+                time_start=start, time_end=end,
+            ))
+
+    # -------------------------------------------------------- SHOOTER TRACKING
+    # Detect shooter firing while not on target
+    tracking_raw = channels.get("/RealOutputs/CustomLogs/SCORING/Tracking", [])
+    shooter_speed = get(channels, "/RealOutputs/CustomLogs/SCORING/Shooter Speed")
+    if tracking_raw and shooter_speed:
+        _SHOOTER_ACTIVE_RPM = 500.0
+        # Find times when shooter is spinning but tracking is False
+        tracking_dict = {}
+        for t, v in tracking_raw:
+            tracking_dict[t] = v
+        # Build interpolated tracking state
+        tracking_times = sorted(tracking_dict.keys())
+
+        def get_tracking_at(t):
+            # Find most recent tracking state
+            best_t = None
+            for tt in tracking_times:
+                if tt <= t:
+                    best_t = tt
+                else:
+                    break
+            if best_t is not None:
+                return tracking_dict[best_t]
+            return None
+
+        off_target_shots = []
+        for t, rpm in shooter_speed:
+            if rpm > _SHOOTER_ACTIVE_RPM:
+                tracking = get_tracking_at(t)
+                if tracking is False:
+                    off_target_shots.append((t, rpm))
+
+        if off_target_shots:
+            # Group into bursts (gap > 2s)
+            bursts = []
+            cur = [off_target_shots[0]]
+            for evt in off_target_shots[1:]:
+                if evt[0] - cur[-1][0] > 2.0:
+                    bursts.append(cur)
+                    cur = [evt]
+                else:
+                    cur.append(evt)
+            bursts.append(cur)
+
+            for burst in bursts:
+                t_start = burst[0][0]
+                t_end = burst[-1][0]
+                dur = t_end - t_start
+                if dur < 0.3:
+                    continue  # skip very brief transients during tracking acquisition
+                issues.append(Issue(
+                    severity=SEVERITY_WARN,
+                    subsystem="SHOOTER",
+                    message=f"Shooter active while off-target "
+                            f"{fmt_time(t_start)}–{fmt_time(t_end)} "
+                            f"({dur:.1f}s)",
+                    time_start=t_start, time_end=t_end,
+                ))
 
     return issues

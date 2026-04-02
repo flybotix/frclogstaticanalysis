@@ -22,7 +22,8 @@ from hoot_converter import parse_hoot
 from device_config import load_device_config, DeviceConfig
 from signals import duration, get
 from analyzers import (analyze_electrical, analyze_mechanical, analyze_revlog,
-                       analyze_hoot, analyze_motor_groups, analyze_radio, roll_up)
+                       analyze_hoot, analyze_motor_groups, analyze_radio,
+                       analyze_system, roll_up)
 from analyzers.subsystems import motor_roll_up
 from report import print_report, print_batch_header, print_batch_row
 
@@ -170,6 +171,7 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
     elec_issues = analyze_electrical(channels, can_map)
     mech_issues = analyze_mechanical(channels, can_map)
     radio_issues = analyze_radio(channels)
+    system_issues = analyze_system(channels)
 
     # Collect all device channels for motor group analysis
     all_device_channels = dict(channels)
@@ -221,7 +223,7 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
     if config and config.groups:
         group_issues = analyze_motor_groups(all_device_channels, config)
 
-    all_issues = elec_issues + mech_issues + radio_issues + rev_issues + hoot_issues + group_issues
+    all_issues = elec_issues + mech_issues + radio_issues + system_issues + rev_issues + hoot_issues + group_issues
 
     extra_subs = config.extra_subsystems if config else []
     statuses = roll_up(all_issues, extra_subsystems=extra_subs)
