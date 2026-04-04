@@ -24,7 +24,12 @@ Extended (with subsystems, motor groups, and control modes):
         "relationship": "same_direction",
         "ratio": 1.0
       }
-    ]
+    ],
+    "swerve": {
+      "max_rotation": "180 deg/s",
+      "translate_input": {"controller": 0, "x_axis": 0, "y_axis": 1},
+      "rotate_input":    {"controller": 0, "axis": 4}
+    }
   }
 
 Valid control_mode values:
@@ -35,10 +40,28 @@ Valid control_mode values:
 If control_mode is omitted, position following error checks are skipped for
 that device (conservative default to avoid false positives).
 
+swerve.max_rotation accepts:
+  - A number (treated as deg/s): 180
+  - A string with units: "180 deg/s", "3.14 rad/s"
+
+swerve.translate_input: identifies the controller and axes used for swerve
+  translation.  {"controller": 0, "x_axis": 0, "y_axis": 1}
+  controller is the DriverStation joystick slot (0-5), x_axis / y_axis are
+  the zero-based axis indices on that controller.
+
+swerve.rotate_input: identifies the controller and axis used for swerve
+  rotation.  {"controller": 0, "axis": 4}
+  May reference a different controller than translate_input.
+
+If either is omitted, the corresponding raw joystick values are not
+included in yaw diagnostic messages.
+
 Both formats can coexist — flat keys are treated as legacy device names
 with no subsystem assignment.
 """
 
+import math
+import re
 from dataclasses import dataclass, field
 
 
@@ -66,10 +89,26 @@ class MotorGroup:
 
 
 @dataclass
+class SwerveTranslateInput:
+    controller: int     # DriverStation joystick slot (0-5)
+    x_axis: int         # axis index for strafe
+    y_axis: int         # axis index for forward/back
+
+
+@dataclass
+class SwerveRotateInput:
+    controller: int     # DriverStation joystick slot (0-5)
+    axis: int           # axis index for rotation
+
+
+@dataclass
 class DeviceConfig:
     devices: dict       # key -> DeviceInfo
     groups: list        # list[MotorGroup]
     extra_subsystems: list  # user-declared subsystem names
+    swerve_max_omega_rad: float = 0.0  # max swerve rotation in rad/s (0 = not configured)
+    swerve_translate_input: SwerveTranslateInput = None  # translation joystick mapping
+    swerve_rotate_input: SwerveRotateInput = None        # rotation joystick mapping
 
     def label(self, device_key: str, fallback: str = "") -> str:
         """Get the human-readable name for a device."""
@@ -93,11 +132,35 @@ class DeviceConfig:
         return ""
 
 
+def _parse_rotation_rate(value) -> float:
+    """
+    Parse a rotation rate into rad/s.
+
+    Accepts:
+      - A number (treated as deg/s): 180 -> pi rad/s
+      - A string with units: "180 deg/s", "3.14 rad/s"
+    Returns rad/s, or 0.0 if unparseable.
+    """
+    if isinstance(value, (int, float)):
+        return math.radians(float(value))
+    if isinstance(value, str):
+        m = re.match(r"^\s*([\d.]+)\s*(deg/?s|rad/?s)\s*$", value.strip(), re.IGNORECASE)
+        if m:
+            num = float(m.group(1))
+            unit = m.group(2).lower().replace("/", "")
+            if unit == "degs":
+                return math.radians(num)
+            elif unit == "rads":
+                return num
+    return 0.0
+
+
 def load_device_config(raw: dict) -> DeviceConfig:
     """Parse a can_map.json dict into a DeviceConfig."""
     devices = {}
     groups = []
     extra_subsystems = []
+    swerve_max_omega_rad = 0.0
 
     # Extended format: "subsystems" key
     if "subsystems" in raw:
@@ -130,8 +193,36 @@ def load_device_config(raw: dict) -> DeviceConfig:
                 ratio=g.get("ratio", 1.0),
             ))
 
+    # Swerve configuration
+    swerve_translate_input = None
+    swerve_rotate_input = None
+    if "swerve" in raw and isinstance(raw["swerve"], dict):
+        swerve = raw["swerve"]
+        mr = swerve.get("max_rotation")
+        if mr is not None:
+            swerve_max_omega_rad = _parse_rotation_rate(mr)
+        ti = swerve.get("translate_input")
+        if isinstance(ti, dict):
+            try:
+                swerve_translate_input = SwerveTranslateInput(
+                    controller=int(ti["controller"]),
+                    x_axis=int(ti["x_axis"]),
+                    y_axis=int(ti["y_axis"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+        ri = swerve.get("rotate_input")
+        if isinstance(ri, dict):
+            try:
+                swerve_rotate_input = SwerveRotateInput(
+                    controller=int(ri["controller"]),
+                    axis=int(ri["axis"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+
     # Legacy format: flat key-value pairs (skip known extended keys)
-    extended_keys = {"subsystems", "devices", "motor_groups"}
+    extended_keys = {"subsystems", "devices", "motor_groups", "swerve"}
     for key, val in raw.items():
         if key in extended_keys:
             continue
@@ -146,4 +237,7 @@ def load_device_config(raw: dict) -> DeviceConfig:
         devices=devices,
         groups=groups,
         extra_subsystems=extra_subsystems,
+        swerve_max_omega_rad=swerve_max_omega_rad,
+        swerve_translate_input=swerve_translate_input,
+        swerve_rotate_input=swerve_rotate_input,
     )

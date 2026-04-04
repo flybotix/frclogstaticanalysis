@@ -182,6 +182,28 @@ def abs_series(series: TimeSeries) -> TimeSeries:
     return [(t, abs(v)) for t, v in series]
 
 
+def interp(series: TimeSeries, t: float) -> float:
+    """Linearly interpolate a time series at timestamp t."""
+    if not series:
+        return 0.0
+    if t <= series[0][0]:
+        return series[0][1]
+    if t >= series[-1][0]:
+        return series[-1][1]
+    lo, hi = 0, len(series) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if series[mid][0] <= t:
+            lo = mid
+        else:
+            hi = mid
+    t0, v0 = series[lo]
+    t1, v1 = series[hi]
+    if t1 == t0:
+        return v0
+    return v0 + (t - t0) / (t1 - t0) * (v1 - v0)
+
+
 def fmt_time(t_sec: float) -> str:
     """Format seconds as M:SS.t"""
     m = int(t_sec) // 60

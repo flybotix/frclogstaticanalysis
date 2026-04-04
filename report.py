@@ -116,25 +116,6 @@ def _print_rich(filepath, match_info, duration_sec, enabled_sec, statuses, filte
     c.print(f"[bold]Duration: [/bold]  {dur_str}  |  Enabled: {ena_str}")
     c.print()
 
-    # Summary table
-    table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold")
-    table.add_column("SUBSYSTEM", style="bold", width=14)
-    table.add_column("STATUS", width=8)
-    table.add_column("ISSUES")
-
-    for ss in statuses:
-        if filter_subsystem and ss.name != filter_subsystem.upper():
-            continue
-        style = _status_color_rich(ss.status)
-        icon = _status_icon(ss.status)
-        table.add_row(
-            ss.name,
-            Text(f"{icon} {ss.status}", style=style),
-            ss.summary,
-        )
-
-    c.print(table)
-
     # Motor summary table
     if motor_statuses and not filter_subsystem:
         _print_motor_table_rich(motor_statuses)
@@ -260,25 +241,6 @@ def _print_ansi(filepath, match_info, duration_sec, enabled_sec, statuses, filte
     print(f"{_BOLD}Match log:{_RESET}  {filename}")
     print(f"{_BOLD}Match:    {_RESET}  {match_info.get('match', 'Unknown')}")
     print(f"{_BOLD}Duration: {_RESET}  {_fmt_dur(duration_sec)}  |  Enabled: {_fmt_dur(enabled_sec)}")
-    print()
-
-    # Summary table header
-    print(_ansi(f"{'SUBSYSTEM':<14}  {'STATUS':<8}  ISSUES", _BOLD))
-    print("─" * 70)
-
-    for ss in statuses:
-        if filter_subsystem and ss.name != filter_subsystem.upper():
-            continue
-        icon = _status_icon(ss.status)
-        if ss.status == "ERR":
-            status_str = _ansi(f"{icon} {ss.status}", _RED, _BOLD)
-        elif ss.status == "WARN":
-            status_str = _ansi(f"{icon} {ss.status}", _YELLOW, _BOLD)
-        else:
-            status_str = _ansi(f"{icon} {ss.status}", _GREEN)
-        # Pad for alignment (ANSI codes add invisible chars)
-        print(f"{ss.name:<14}  {status_str:<8}  {ss.summary}")
-
     print()
 
     # Motor summary table

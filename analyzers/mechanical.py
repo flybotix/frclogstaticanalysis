@@ -6,6 +6,8 @@ Mechanical issue detection:
   - Intake roller imbalance (left vs right divergence)
   - Turret position drift
   - Swerve heading error, translation drift, pose jumps
+  - LAG_IN_COMMANDED_YAW (robot can't keep up with rotation command)
+  - UNCOMMANDED_YAW (robot rotates without driver input)
   - Indexer jam detection
   - Vision system dropout
 """
@@ -14,9 +16,10 @@ import math
 from signals import (
     get, find_channels, find_threshold_spans, find_true_spans,
     subtract, abs_series, derivative, is_near_zero, find_pose_jumps,
-    fmt_time, fmt_duration
+    interp, fmt_time, fmt_duration
 )
 from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO
+from device_config import DeviceConfig
 
 
 def _motor_label(channel_name: str, can_map: dict) -> str:
@@ -51,7 +54,86 @@ def _strip_motor_name(channel_name: str) -> str:
         return parts[-1]
 
 
-def analyze_mechanical(channels: dict, can_map: dict = None) -> list[Issue]:
+# --- LAG_IN_COMMANDED_YAW thresholds ---
+_DEFAULT_MAX_OMEGA_RAD = 2 * math.pi  # 360 deg/s fallback when not configured
+_YAW_LAG_STICK_THRESH = 0.20   # min stick deflection to consider driver is commanding rotation
+_YAW_LAG_RATIO = 0.35          # actual < 35% of expected = lagging
+_YAW_LAG_MIN_DURATION = 0.75   # must persist 750ms (excludes normal 200-400ms ramp)
+_YAW_LAG_WINDOW_SEC = 0.5      # rolling window for smoothing
+
+# --- UNCOMMANDED_YAW thresholds ---
+_UNCMD_STICK_DEADBAND = 0.10    # stick below this = "not commanding rotation"
+_UNCMD_COAST_WINDOW = 0.3       # seconds — lookback for recent stick input
+_UNCMD_COAST_THRESH = 0.15      # stick above this in lookback = coast-down
+_UNCMD_ACTUAL_THRESH_RAD = math.radians(15)  # 15 deg/s min actual to flag
+_UNCMD_MIN_DURATION = 0.5       # seconds — must persist to distinguish from impact
+_UNCMD_WINDOW_SEC = 0.5         # rolling window for smoothing
+_UNCMD_TRANSLATE_DEADBAND = 0.10  # translation stick magnitude below this = parked
+
+# --- Impact detection ---
+_IMPACT_ACCEL_G = 1.5           # lateral acceleration threshold (g) from Pigeon
+_IMPACT_SUPPRESS_SEC = 0.5      # suppress yaw detection for this long after impact
+_IMPACT_ANG_ACCEL_RAD = 50.0    # rad/s² — fallback when no Pigeon accel available
+
+
+def _nearest_axes(axis_raw: list, t: float) -> list | None:
+    """Return the nearest axis values list for timestamp t, or None."""
+    if not axis_raw:
+        return None
+    lo, hi = 0, len(axis_raw) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if axis_raw[mid][0] <= t:
+            lo = mid
+        else:
+            hi = mid
+    best = lo if abs(axis_raw[lo][0] - t) <= abs(axis_raw[hi][0] - t) else hi
+    axes = axis_raw[best][1]
+    return axes if isinstance(axes, list) else None
+
+
+def _fmt_swerve_inputs(channels: dict, config, t: float) -> str:
+    """Format the configured swerve joystick axes at timestamp t."""
+    if not config:
+        return ""
+    parts = []
+    ti = config.swerve_translate_input
+    ri = config.swerve_rotate_input
+    if ti:
+        axes = _nearest_axes(
+            channels.get(f"/DriverStation/Joystick{ti.controller}/AxisValues", []), t)
+        if axes and ti.x_axis < len(axes) and ti.y_axis < len(axes):
+            parts.append(f"translate=[{axes[ti.x_axis]:+.2f}, {axes[ti.y_axis]:+.2f}]")
+    if ri:
+        axes = _nearest_axes(
+            channels.get(f"/DriverStation/Joystick{ri.controller}/AxisValues", []), t)
+        if axes and ri.axis < len(axes):
+            parts.append(f"rotate=[{axes[ri.axis]:+.2f}]")
+    return ", ".join(parts)
+
+
+def _compute_actual_omega(pose_raw: list) -> list:
+    """Derive angular velocity series from Pose2d rotation, handling wrapping."""
+    series = []
+    for i in range(1, len(pose_raw)):
+        t0, p0 = pose_raw[i - 1]
+        t1, p1 = pose_raw[i]
+        if p0 is None or p1 is None:
+            continue
+        dt = t1 - t0
+        if dt <= 0 or dt > 0.2:
+            continue
+        dtheta = p1["rotation_rad"] - p0["rotation_rad"]
+        while dtheta > math.pi:
+            dtheta -= 2 * math.pi
+        while dtheta < -math.pi:
+            dtheta += 2 * math.pi
+        series.append(((t0 + t1) / 2, dtheta / dt))
+    return series
+
+
+def analyze_mechanical(channels: dict, can_map: dict = None,
+                       config: DeviceConfig = None) -> list[Issue]:
     issues = []
     can_map = can_map or {}
 
@@ -282,6 +364,248 @@ def analyze_mechanical(channels: dict, can_map: dict = None) -> list[Issue]:
                     time_end=t_end,
                     detail="SWERVE",
                 ))
+
+    # --- Joystick-driven yaw analysis ---
+    # Both LAG_IN_COMMANDED_YAW and UNCOMMANDED_YAW require configured joystick
+    # mappings. Without them we cannot know the driver's intent.
+    _have_rotate_input = config and config.swerve_rotate_input is not None
+    _have_translate_input = config and config.swerve_translate_input is not None
+
+    if _have_rotate_input and pose_raw:
+        actual_omega_series = _compute_actual_omega(pose_raw)
+        ri = config.swerve_rotate_input
+        rotate_raw = channels.get(
+            f"/DriverStation/Joystick{ri.controller}/AxisValues", [])
+
+        # Build rotation stick time series
+        rotate_stick = []  # (t, axis_value)
+        for t, axes in rotate_raw:
+            if isinstance(axes, list) and ri.axis < len(axes):
+                rotate_stick.append((t, axes[ri.axis]))
+
+        # Build translation stick magnitude series (if configured)
+        translate_stick = []  # (t, magnitude)
+        if _have_translate_input:
+            ti = config.swerve_translate_input
+            translate_raw = channels.get(
+                f"/DriverStation/Joystick{ti.controller}/AxisValues", [])
+            for t, axes in translate_raw:
+                if isinstance(axes, list):
+                    tx = axes[ti.x_axis] if ti.x_axis < len(axes) else 0.0
+                    ty = axes[ti.y_axis] if ti.y_axis < len(axes) else 0.0
+                    translate_stick.append((t, math.sqrt(tx ** 2 + ty ** 2)))
+
+        # Build impact suppression mask from Pigeon accelerometer data.
+        # Timestamps within _IMPACT_SUPPRESS_SEC of a lateral acceleration spike
+        # are considered impact-induced and excluded from yaw analysis.
+        impact_times = []  # list of impact timestamps
+        accel_x_chs = find_channels(channels, "Pigeon", "AccelerationX")
+        accel_y_chs = find_channels(channels, "Pigeon", "AccelerationY")
+        if accel_x_chs and accel_y_chs:
+            ax_series = get(channels, accel_x_chs[0])
+            ay_series = get(channels, accel_y_chs[0])
+            # Compute lateral acceleration magnitude at each ax timestamp
+            for t, ax_val in ax_series:
+                ay_val = interp(ay_series, t)
+                lateral_g = math.sqrt(ax_val ** 2 + ay_val ** 2)
+                if lateral_g > _IMPACT_ACCEL_G:
+                    impact_times.append(t)
+        elif actual_omega_series:
+            # Fallback: detect impacts from angular acceleration spikes
+            for i in range(1, len(actual_omega_series)):
+                t0, w0 = actual_omega_series[i - 1]
+                t1, w1 = actual_omega_series[i]
+                dt = t1 - t0
+                if dt > 0 and abs(w1 - w0) / dt > _IMPACT_ANG_ACCEL_RAD:
+                    impact_times.append(t1)
+
+        def _in_impact_window(t: float) -> bool:
+            """True if t is within _IMPACT_SUPPRESS_SEC of any impact."""
+            for it in impact_times:
+                if abs(t - it) <= _IMPACT_SUPPRESS_SEC:
+                    return True
+                if it > t + _IMPACT_SUPPRESS_SEC:
+                    break
+            return False
+
+        max_omega = _DEFAULT_MAX_OMEGA_RAD
+        if config.swerve_max_omega_rad > 0:
+            max_omega = config.swerve_max_omega_rad
+
+        # --- LAG_IN_COMMANDED_YAW ---
+        # Driver's rotation stick is significantly deflected but robot isn't
+        # turning proportionally.
+        if rotate_stick and actual_omega_series:
+            point_ratios = []  # (t, ratio)
+            for t, stick_val in rotate_stick:
+                if abs(stick_val) < _YAW_LAG_STICK_THRESH:
+                    continue
+                if _in_impact_window(t):
+                    continue
+                expected_omega = abs(stick_val) * max_omega
+                actual = abs(interp(actual_omega_series, t))
+                point_ratios.append((t, actual / expected_omega))
+
+            # Rolling average
+            smoothed_lag = []
+            j_start = 0
+            for i, (t, _) in enumerate(point_ratios):
+                while j_start < i and point_ratios[j_start][0] < t - _YAW_LAG_WINDOW_SEC:
+                    j_start += 1
+                window = point_ratios[j_start:i + 1]
+                if len(window) >= 3:
+                    avg_ratio = sum(r for _, r in window) / len(window)
+                    smoothed_lag.append((t, avg_ratio))
+
+            lag_spans = find_threshold_spans(
+                smoothed_lag, threshold=_YAW_LAG_RATIO,
+                min_duration=_YAW_LAG_MIN_DURATION, above=False,
+            )
+
+            if lag_spans:
+                episodes: list[list] = [[lag_spans[0]]]
+                for span in lag_spans[1:]:
+                    if span[0] - episodes[-1][-1][1] > 5.0:
+                        episodes.append([span])
+                    else:
+                        episodes[-1].append(span)
+
+                for episode in episodes:
+                    t_start = episode[0][0]
+                    t_end = episode[-1][1]
+                    total_lag = sum(e - s for s, e, _ in episode)
+                    count = len(episode)
+                    worst_ratio = min(p for _, _, p in episode)
+
+                    worst_t = t_start
+                    for t_s, r_s in smoothed_lag:
+                        if t_s >= t_start and t_s <= t_end and r_s <= worst_ratio + 0.01:
+                            worst_t = t_s
+                            break
+
+                    sev = SEVERITY_ERR if total_lag > 2.0 else SEVERITY_WARN
+                    max_deg = math.degrees(max_omega)
+                    input_str = _fmt_swerve_inputs(channels, config, worst_t)
+                    parts = [
+                        f"LAG_IN_COMMANDED_YAW: "
+                        f"{fmt_time(t_start)} – {fmt_time(t_end)}",
+                    ]
+                    if count > 1:
+                        parts.append(f"{count} spans / {total_lag:.1f}s total lag")
+                    else:
+                        parts.append(f"{total_lag:.1f}s")
+                    parts.append(f"worst {worst_ratio:.0%} of commanded")
+                    if input_str:
+                        parts.append(input_str)
+                    parts.append(
+                        f"[max {max_deg:.0f}°/s"
+                        + (" — configured" if config.swerve_max_omega_rad > 0
+                           else " — default")
+                        + "]"
+                    )
+                    issues.append(Issue(
+                        severity=sev,
+                        subsystem="SWERVE",
+                        message=", ".join(parts),
+                        time_start=t_start,
+                        time_end=t_end,
+                        detail="SWERVE",
+                    ))
+
+        # --- UNCOMMANDED_YAW ---
+        # Rotation stick is in the deadband but the robot is rotating.
+        # Filters: coast-down (recent stick), impacts (Pigeon accel / angular accel).
+        if rotate_stick and actual_omega_series:
+            uncmd_points = []  # (t, |actual_omega|)
+            j_coast = 0
+            for i, (t, stick_val) in enumerate(rotate_stick):
+                # Stick must be in deadband right now
+                if abs(stick_val) > _UNCMD_STICK_DEADBAND:
+                    continue
+
+                # Coast-down filter: no significant stick in recent window
+                while j_coast < i and rotate_stick[j_coast][0] < t - _UNCMD_COAST_WINDOW:
+                    j_coast += 1
+                recent_max = 0.0
+                for k in range(j_coast, i + 1):
+                    recent_max = max(recent_max, abs(rotate_stick[k][1]))
+                if recent_max > _UNCMD_COAST_THRESH:
+                    continue
+
+                # Impact filter
+                if _in_impact_window(t):
+                    continue
+
+                # Robot must be doing something — either translating or rotating
+                act_w = abs(interp(actual_omega_series, t))
+                trans_mag = interp(translate_stick, t) if translate_stick else 0.0
+                if trans_mag < _UNCMD_TRANSLATE_DEADBAND and act_w < _UNCMD_ACTUAL_THRESH_RAD:
+                    continue
+
+                uncmd_points.append((t, act_w))
+
+            # Rolling-window smoothing
+            smoothed_uncmd = []
+            j_start = 0
+            for i, (t, _) in enumerate(uncmd_points):
+                while j_start < i and uncmd_points[j_start][0] < t - _UNCMD_WINDOW_SEC:
+                    j_start += 1
+                window = uncmd_points[j_start:i + 1]
+                if len(window) >= 3:
+                    avg_w = sum(w for _, w in window) / len(window)
+                    smoothed_uncmd.append((t, avg_w))
+
+            uncmd_spans = find_threshold_spans(
+                smoothed_uncmd, threshold=_UNCMD_ACTUAL_THRESH_RAD,
+                min_duration=_UNCMD_MIN_DURATION, above=True,
+            )
+
+            if uncmd_spans:
+                episodes = [[uncmd_spans[0]]]
+                for span in uncmd_spans[1:]:
+                    if span[0] - episodes[-1][-1][1] > 5.0:
+                        episodes.append([span])
+                    else:
+                        episodes[-1].append(span)
+
+                for episode in episodes:
+                    t_start = episode[0][0]
+                    t_end = episode[-1][1]
+                    total_dur = sum(e - s for s, e, _ in episode)
+                    count = len(episode)
+                    peak_omega = max(p for _, _, p in episode)
+
+                    peak_t = t_start
+                    for t_s, w_s in smoothed_uncmd:
+                        if t_s >= t_start and t_s <= t_end and w_s >= peak_omega - 0.01:
+                            peak_t = t_s
+                            break
+
+                    trans_at_peak = interp(translate_stick, peak_t) if translate_stick else 0.0
+
+                    sev = SEVERITY_ERR if total_dur > 2.0 else SEVERITY_WARN
+                    input_str = _fmt_swerve_inputs(channels, config, peak_t)
+                    parts = [
+                        f"UNCOMMANDED_YAW: "
+                        f"{fmt_time(t_start)} – {fmt_time(t_end)}",
+                    ]
+                    if count > 1:
+                        parts.append(f"{count} spans / {total_dur:.1f}s total")
+                    else:
+                        parts.append(f"{total_dur:.1f}s")
+                    parts.append(f"peak {math.degrees(peak_omega):.0f}°/s")
+                    if trans_at_peak > _UNCMD_TRANSLATE_DEADBAND:
+                        parts.append(f"while translating (stick {trans_at_peak:.2f})")
+                    if input_str:
+                        parts.append(input_str)
+                    issues.append(Issue(
+                        severity=sev,
+                        subsystem="SWERVE",
+                        message=", ".join(parts),
+                        time_start=t_start,
+                        time_end=t_end,
+                        detail="SWERVE",
+                    ))
 
     # Translation drift: large TranslateX/Y vs commanded speeds
     trans_x = get(channels, "/RealOutputs/CustomLogs/SWERVE/TranslateX")

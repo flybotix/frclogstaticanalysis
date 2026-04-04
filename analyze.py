@@ -169,7 +169,7 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
     game_timeline, match_start = get_game_mode_timeline(channels)
 
     elec_issues = analyze_electrical(channels, can_map)
-    mech_issues = analyze_mechanical(channels, can_map)
+    mech_issues = analyze_mechanical(channels, can_map, config=config)
     radio_issues = analyze_radio(channels)
     system_issues = analyze_system(channels)
 
