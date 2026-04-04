@@ -460,7 +460,7 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
             bad = [(t, v) for t, v in magnet_series if isinstance(v, str) and v != "Magnet_Green"]
             if bad:
                 issues.append(Issue(
-                    severity=SEVERITY_WARN,
+                    severity=SEVERITY_ERR,
                     subsystem=subsystem,
                     message=f"{label} magnet health: {bad[0][1]} at {fmt_time(bad[0][0])}",
                     time_start=bad[0][0], detail=detail,

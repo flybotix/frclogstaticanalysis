@@ -98,7 +98,7 @@ Both dependencies are optional. The tool runs with no external packages installe
 
 ### `can_map.json` (optional)
 
-Place a `can_map.json` file in the project root to configure device labels, subsystem assignments, and motor groups. The file supports two formats that can be mixed in the same file.
+Place a `can_map.json` file in the project root to configure device labels, subsystem assignments, motor groups, and swerve drive analysis. The file supports two formats that can be mixed in the same file.
 
 #### Simple format
 
@@ -115,17 +115,23 @@ Flat key-value pairs for device labeling only:
 
 #### Extended format
 
-Adds subsystem routing and motor group comparison:
+Adds subsystem routing, motor group comparison, and swerve configuration:
 
 ```json
 {
+  "swerve": {
+    "max_rotation": "180 deg/s",
+    "translate_input": {"controller": 0, "x_axis": 0, "y_axis": 1},
+    "rotate_input":    {"controller": 0, "axis": 4}
+  },
+
   "subsystems": ["ELEVATOR", "SWERVE", "INTAKE"],
 
   "devices": {
-    "CTRE:TalonFX-29": { "name": "Elevator Left",   "subsystem": "ELEVATOR" },
-    "CTRE:TalonFX-34": { "name": "Elevator Right",  "subsystem": "ELEVATOR" },
-    "CTRE:TalonFX-2":  { "name": "FL Drive Falcon",  "subsystem": "SWERVE" },
-    "CTRE:TalonFX-3":  { "name": "FL Steer Falcon",  "subsystem": "SWERVE" },
+    "CTRE:TalonFX-29": { "name": "Elevator Left",   "subsystem": "ELEVATOR", "control_mode": "position" },
+    "CTRE:TalonFX-34": { "name": "Elevator Right",  "subsystem": "ELEVATOR", "control_mode": "position" },
+    "CTRE:TalonFX-2":  { "name": "FL Drive Falcon",  "subsystem": "SWERVE",  "control_mode": "velocity" },
+    "CTRE:TalonFX-3":  { "name": "FL Steer Falcon",  "subsystem": "SWERVE",  "control_mode": "position" },
     "SPARK:16":         { "name": "Indexer",           "subsystem": "INTAKE" },
     "CTRE:Pigeon2-30":  { "name": "IMU",              "subsystem": "SWERVE" },
     "PDH:0":            { "name": "FL Drive",          "subsystem": "SWERVE" }
@@ -150,9 +156,28 @@ Adds subsystem routing and motor group comparison:
 }
 ```
 
+**`swerve`** — Configures swerve drive yaw analysis. Required for `LAG_IN_COMMANDED_YAW` and `UNCOMMANDED_YAW` detection (see [Swerve Yaw Analysis](#swerve-yaw-analysis)). Fields:
+
+| Field | Description |
+|---|---|
+| `max_rotation` | Maximum swerve rotation rate. Accepts a number (deg/s) or a string with units: `"180 deg/s"`, `"3.14 rad/s"`. Used to compute expected yaw rate from stick deflection. Defaults to 360 deg/s if omitted. |
+| `translate_input` | Identifies the driver's translation joystick: `{"controller": N, "x_axis": N, "y_axis": N}`. `controller` is the DriverStation slot (0-5), axes are zero-based indices on that controller. |
+| `rotate_input` | Identifies the driver's rotation joystick: `{"controller": N, "axis": N}`. May reference a different controller than `translate_input`. |
+
+Translation and rotation inputs can be on the same controller (e.g., left stick for translation, right stick X for rotation) or on different controllers entirely. Without `rotate_input`, yaw analysis is skipped — there is no way to infer driver intent without knowing which stick controls rotation.
+
 **`subsystems`** — Declares subsystem names that should appear in the report table. These are merged with the defaults (`ELECTRICAL`, `RADIO`, `SHOOTER`, `INTAKE`, `TURRET`, `SWERVE`, `CAN`, `MOTORS`). Without this, CTRE and REV device issues all land under `MOTORS` since those log formats have no concept of which subsystem a motor belongs to.
 
-**`devices`** — Maps device keys to a name and subsystem. When a device has a subsystem assignment, all issues from that device (faults, voltage sags, current spikes, etc.) appear under that subsystem instead of the generic `HOOT`/`REVLOG`.
+**`devices`** — Maps device keys to a name, subsystem, and optional control mode. When a device has a subsystem assignment, all issues from that device (faults, voltage sags, current spikes, etc.) appear under that subsystem instead of the generic `HOOT`/`REVLOG`.
+
+The optional `control_mode` field affects position following error checks for CTRE TalonFX devices:
+
+| Control mode | Behavior |
+|---|---|
+| `"position"` | Position following error checks are enabled |
+| `"velocity"` | Position following error checks are skipped |
+| `"motion_profile"` | Position following error checks are enabled |
+| _(omitted)_ | Position following error checks are skipped (conservative default) |
 
 **`motor_groups`** — Defines mechanically linked motors for comparison analysis. The analyzer detects:
 - **Output divergence** (ERR): one motor driving while the other is off
@@ -185,19 +210,36 @@ Thresholds are defined as constants at the top of each analyzer module:
 
 | File | Threshold | Default |
 |---|---|---|
+| `analyzers/electrical.py` | Brownout | `SystemStats/BrownedOut = true` |
 | `analyzers/electrical.py` | Low battery voltage | < 11.0 V for > 1 s |
 | `analyzers/electrical.py` | Voltage sag detection | 2.0 V drop in 0.5 s |
 | `analyzers/electrical.py` | Sustained current spike | > 40 A for > 0.5 s |
 | `analyzers/electrical.py` | Instantaneous current spike | > 60 A |
+| `analyzers/electrical.py` | Voltage rail fault | 3v3/5v/6v rail fault count > 0 |
 | `analyzers/revlog.py` | Motor over-temperature | > 80 C for > 2 s |
 | `analyzers/revlog.py` | Motor stall | output > 0.3 and velocity < 50 RPM for > 0.5 s |
 | `analyzers/revlog.py` | Power starved (per motor) | < 7.0 V for > 5 s |
 | `analyzers/revlog.py` | Bus voltage sag (per motor) | < 10.0 V for > 0.5 s |
+| `analyzers/revlog.py` | HasReset mid-session | Motor rebooted during session |
 | `analyzers/hoot.py` | TalonFX over-temperature | > 80 C for > 2 s |
 | `analyzers/hoot.py` | Power starved (per device) | < 7.0 V for > 5 s |
 | `analyzers/hoot.py` | Supply voltage sag (per device) | < 10.0 V for > 0.5 s |
 | `analyzers/hoot.py` | Stator current spike | > 80 A for > 0.5 s |
 | `analyzers/hoot.py` | Motor output lost | > 5V to 0V, stays at 0 for 5+ samples |
+| `analyzers/hoot.py` | Motor rebooted while enabled | `Fault_BootDuringEnable` active while enabled |
+| `analyzers/hoot.py` | Duty cycle saturated | abs(duty cycle) > 0.98 for > 1 s |
+| `analyzers/hoot.py` | Position following error | > 0.5 rotations for > 0.5 s (position/motion-profile modes only) |
+| `analyzers/hoot.py` | Static brake disabled | `Fault_StaticBrakeDisabled` active |
+| `analyzers/hoot.py` | Stator/supply current limiting | `Fault_StatorCurrLimit` or `Fault_SupplyCurrLimit` active while enabled |
+
+**System / roboRIO:**
+
+| File | Check | ERR | WARN |
+|---|---|---|---|
+| `analyzers/system.py` | CAN bus utilization | > 75% for > 1 s | 60–75% for > 1 s |
+| `analyzers/system.py` | roboRIO CPU temperature | > 75 C for > 5 s | 65–75 C for > 5 s |
+| `analyzers/system.py` | Loop overrun (full cycle) | > 100 ms for > 1 s | 40–100 ms for > 1 s |
+| `analyzers/system.py` | GC pause | > 50 ms | ≥ 3 pauses > 20 ms |
 
 **Radio / Communications:**
 
@@ -209,6 +251,74 @@ Thresholds are defined as constants at the top of each analyzer module:
 | `analyzers/radio.py` | Connection quality | — | below "good" | — |
 | `analyzers/radio.py` | Comms dropout burst | ≥ 5 events | 2–4 events | 1 event |
 | `analyzers/radio.py` | Radio disconnect | while enabled | while disabled | — |
+
+**Mechanical / Swerve:**
+
+| File | Check | Threshold |
+|---|---|---|
+| `analyzers/mechanical.py` | Shooter velocity error | > 200 RPM error for > 0.5 s |
+| `analyzers/mechanical.py` | Intake motor stall | Voltage > 4V, rotation ≈ 0 for > 0.5 s |
+| `analyzers/mechanical.py` | Intake roller imbalance | Left/right voltage diff > 3V for > 1 s |
+| `analyzers/mechanical.py` | Turret position drift | > 5°/s drift with voltage ≈ 0 for > 1 s |
+| `analyzers/mechanical.py` | Indexer jam/stall | Commanded > 100 RPM, actual < 20 RPM for > 0.5 s |
+| `analyzers/mechanical.py` | Shooter active while off-target | Shooter > 500 RPM with tracking = false for > 0.3 s |
+| `analyzers/mechanical.py` | Swerve heading error | driveRotate vs TargetSpeeds.omega > 10°/s for > 0.5 s |
+| `analyzers/mechanical.py` | Swerve pose jump | Jump > 0.3 m in < 0.1 s |
+| `analyzers/mechanical.py` | Swerve translation drift | TranslateX/Y vs commanded > 0.3 m/s for > 0.5 s |
+| `analyzers/mechanical.py` | Vision dropout | Gap > 3 s in VisionPose data (ERR), > 1 s (WARN) |
+| `analyzers/mechanical.py` | Vision high ambiguity | Ambiguity ratio > 0.15 for > 0.5 s |
+
+**Pigeon2 IMU** (from `.hoot` files):
+
+| Check | ERR | WARN |
+|---|---|---|
+| Collision / impact | Lateral acceleration > 2.0 g | > 1.5 g |
+| Pitch tilt | > 15° for > 0.5 s | 10–15° for > 0.5 s |
+| Roll tilt | > 15° for > 0.5 s | 10–15° for > 0.5 s |
+| Gyro drift while stationary | — | > 0.5°/s with NoMotionCount > 0 for > 3 s |
+| Over-temperature | — | > 50 C for > 5 s |
+| Magnetometer interference | — | > 100 µT for > 1 s |
+| Sensor saturation | — | Accelerometer, gyroscope, or magnetometer saturated |
+
+**CANcoder** (from `.hoot` files):
+
+| Check | Severity |
+|---|---|
+| Bad magnet health | ERR |
+| Hardware fault | ERR |
+
+### Swerve yaw analysis
+
+When `swerve.rotate_input` is configured in `can_map.json`, the analyzer compares the driver's raw joystick inputs against the robot's actual rotation (derived from `SWERVE/Current Pose`) to detect two classes of drivetrain issues:
+
+**LAG_IN_COMMANDED_YAW** — The driver is pushing the rotation stick but the robot isn't turning proportionally.
+
+- Computes expected yaw rate as `|stick_deflection| * max_rotation`
+- Compares against actual yaw rate from pose differentiation
+- Flags when actual < 35% of expected, sustained for > 0.75 s
+- Severity: ERR if total lag > 2 s, WARN otherwise
+- Possible causes: CG imbalance, pinned by another robot, rotating against a wall, drivetrain binding
+
+**UNCOMMANDED_YAW** — The robot is rotating when the driver's rotation stick is in the deadband.
+
+- Checks the raw rotation axis is below deadband (< 0.10) with no recent input (< 0.15 in preceding 0.3 s)
+- Flags when actual yaw rate > 15°/s, sustained for > 0.5 s
+- Severity: ERR if total duration > 2 s, WARN otherwise
+- Possible causes: swerve module steering offset error, unequal drive motor output, wheel scrub
+
+Both detections filter out **impacts** to avoid false positives:
+- **Primary** (when `.hoot` Pigeon2 data is available): lateral acceleration from `AccelerationX/Y` > 1.5 g suppresses a 0.5 s window
+- **Fallback** (wpilog only): angular acceleration from pose > 50 rad/s² suppresses a 0.5 s window
+
+Issue messages include the raw joystick values at the worst moment so teams can verify driver intent:
+
+```
+LAG_IN_COMMANDED_YAW: T+2:16 – T+2:23, 6.8s, worst 23% of commanded,
+  translate=[-0.78, +0.64], rotate=[+0.40], [max 180°/s — configured]
+
+UNCOMMANDED_YAW: T+1:25 – T+1:43, 3 spans / 16.3s total, peak 29°/s,
+  while translating (stick 0.80), translate=[-0.12, +0.79], rotate=[+0.00]
+```
 
 ### Voltage sag severity levels
 
@@ -277,6 +387,20 @@ The discovery logic handles the different filename conventions used by each vend
 - `.revlog` — `REV_YYYYMMDD_HHMMSS.revlog` (e.g., `REV_20260324_233816.revlog`)
 - `.hoot` — `*_YYYY-MM-DD_HH-MM-SS.hoot` (e.g., `rio_2026-03-24_23-38-19.hoot`)
 
+### Auto-discovery by match ID
+
+If you have `.hoot` files with FMS match IDs in their filenames (e.g., `VAALE1_Q32_rio_2025-09-27_14-08-53.hoot`), you can discover all logs for a match by its ID:
+
+```bash
+# Find all logs for qualification match 32
+python3 analyze.py --dir logs/ --match Q32
+
+# Full event-qualified match ID
+python3 analyze.py -d logs/ -m VAALE1_Q32
+```
+
+The match ID is matched as a delimited component in `.hoot` filenames. Once hoot files are found, their timestamp is used to discover matching `.wpilog` and `.revlog` files.
+
 ### Explicit file paths
 
 Specify any combination of individual log files directly:
@@ -306,8 +430,9 @@ python3 analyze.py --hoot canivore.hoot rio.hoot
 ### Options
 
 ```
--d, --dir DIR          Directory for auto-discovery (use with --time)
+-d, --dir DIR          Directory for auto-discovery (use with --time or --match)
 -t, --time TIMESTAMP   Timestamp prefix for auto-discovery
+-m, --match ID         FMS match identifier for auto-discovery (e.g., Q32, VAALE1_Q32)
 -r, --revlog FILE      Path to .revlog file
     --hoot FILE [FILE]  Path to one or more .hoot files
 -s, --subsystem NAME   Filter output to one subsystem
