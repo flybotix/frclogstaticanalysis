@@ -1,4 +1,12 @@
-# FRC Robot Log Analyzer
+```
+ ____   _   _   _   _   _   _   ____    _____
+|  _ \ | | | | | | | | | | | | |  _ \  |_   _|
+| |_) || | | | | |_| | | | | | | |_) |   | |
+|  _ < | |_| | |  _  | | |_| | |  _ <    | |
+|_| \_\ \___/  |_| |_|  \___/  |_| \_\   |_|
+
+  R U HURT — Robot Unified Health Update & Readiness Tool
+```
 
 ![Miscellaneous issues log analysis](images/miscissues.png)
 
