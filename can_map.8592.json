@@ -1,0 +1,65 @@
+{
+  "swerve": {
+    "max_rotation": "90 deg/s",
+    "translate_input": {"controller": 0, "x_axis": 0, "y_axis": 1},
+    "rotate_input":    {"controller": 0, "axis": 4}
+  },
+
+  "devices": {
+    "CTRE:TalonFX-9":  {"name": "SWERVE-THROTTLE-WHT-FL-09", "subsystem": "SWERVE", "control_mode": "velocity"},
+    "CTRE:TalonFX-6":  {"name": "SWERVE-AZIMUTH-WHT-FL-06",  "subsystem": "SWERVE", "control_mode": "position"},
+    "CTRE:TalonFX-5":  {"name": "SWERVE-THROTTLE-ORG-FL-05", "subsystem": "SWERVE", "control_mode": "velocity"},
+    "CTRE:TalonFX-4":  {"name": "SWERVE-AZIMUTH-ORG-FL-04",  "subsystem": "SWERVE", "control_mode": "position"},
+    "CTRE:TalonFX-7":  {"name": "SWERVE-THROTTLE-BLK-FL-07", "subsystem": "SWERVE", "control_mode": "velocity"},
+    "CTRE:TalonFX-8":  {"name": "SWERVE-AZIMUTH-BLK-FL-08",  "subsystem": "SWERVE", "control_mode": "position"},
+    "CTRE:TalonFX-3":  {"name": "SWERVE-THROTTLE-TEA-FL-03", "subsystem": "SWERVE", "control_mode": "velocity"},
+    "CTRE:TalonFX-2":  {"name": "SWERVE-AZIMUTH-TEA-FL-02",  "subsystem": "SWERVE", "control_mode": "position"},
+    "CTRE:TalonFX-20": {"name": "SHOOTER-TURRET-20",          "subsystem": "TURRET", "control_mode": "position"},
+    "CTRE:TalonFX-13": {"name": "SHOOTER-REAR-13",            "subsystem": "SHOOTER"},
+    "CTRE:TalonFX-19": {"name": "SHOOTER-FRONT-19",           "subsystem": "SHOOTER"},
+    "CTRE:TalonFX-29": {"name": "INTAKE-ROLLER-RIGHT-29",     "subsystem": "INTAKE"},
+    "CTRE:TalonFX-34": {"name": "INTAKE-ROLLER-LEFT-34",      "subsystem": "INTAKE"}
+  },
+
+  "PDH:16": "SWERVE-THROTTLE-WHT-FL",
+  "PDH:17": "SWERVE-AZIMUTH-WHT-FL",
+  "CTRE:CANCODER-18": "SWERVE-CANCODER-WHT-FL-18",
+
+  "PDH:19": "SWERVE-THROTTLE-ORG-FL",
+  "PDH:18": "SWERVE-AZIMUTH-ORG-FL",
+  "CTRE:CANCODER-21": "SWERVE-CANCODER-ORG-FL-21",
+
+  "PDH:4": "SWERVE-THROTTLE-BLK-FL",
+  "PDH:5": "SWERVE-AZIMUTH-BLK-FL",
+  "CTRE:CANCODER-15": "SWERVE-CANCODER-BLK-FL-15",
+
+  "PDH:0": "SWERVE-THROTTLE-TEA-FL",
+  "PDH:1": "SWERVE-AZIMUTH-TEA-FL",
+  "CTRE:CANCODER-12": "SWERVE-CANCODER-TEA-FL-12",
+
+  "CTRE:30": "Pigeon",
+
+  "SHOOTER/Flywheel":  10,
+  "INTAKE/Roller":     12,
+
+  "PDH:8": "INDEXER-DYEROTOR",
+  "SPARK:16": "INDEXER-DYEROTOR-16",
+  "PDH:3": "INDEXER-FEEDER",
+  "SPARK:32": "INDEXER-FEEDER-32",
+  "SPARK:38": "INDEXER-FEEDER-38",
+
+  "PDH:14": "INTAKE-EXTEND",
+  "SPARK:31": "INTAKE-EXTEND-31",
+  "PDH:15": "INTAKE-ROLLER-RIGHT",
+  "PDH:12": "INTAKE-ROLLER-LEFT",
+
+  "PDH:2": "SHOOTER-TURRET",
+  "PDH:6": "SHOOTER-REAR",
+  "PDH:7": "SHOOTER-FRONT",
+
+  "PDH:20": "RIO",
+  "PDH:23": "DC-DC Converter",
+  "PDH:9": "MPM",
+  "PDH:21": "Radio21",
+  "PDH:22": "Radio22"
+}
