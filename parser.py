@@ -53,12 +53,19 @@ def _decode_value(payload: bytes, type_str: str) -> Any:
     if type_str == "string[]":
         strings = []
         pos = 0
-        while pos + 4 <= len(payload):
+        if pos + 4 > len(payload):
+            return strings
+        count = int.from_bytes(payload[pos:pos + 4], "little")
+        pos += 4
+        for _ in range(count):
+            if pos + 4 > len(payload):
+                break
             length = int.from_bytes(payload[pos:pos + 4], "little")
             pos += 4
-            if pos + length <= len(payload):
-                strings.append(payload[pos:pos + length].decode("utf-8", errors="replace"))
-                pos += length
+            if pos + length > len(payload):
+                break
+            strings.append(payload[pos:pos + length].decode("utf-8", errors="replace"))
+            pos += length
         return strings
     if type_str == "struct:Pose2d":
         if len(payload) >= 24:

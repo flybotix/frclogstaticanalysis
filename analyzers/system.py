@@ -10,6 +10,7 @@ System health detection:
 
 from signals import get, get_bool, find_channels, find_threshold_spans, fmt_time
 from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO
+from parser import get_game_mode_at, MODE_DISABLED
 
 # CAN bus utilization thresholds (fraction 0-1)
 _CAN_UTIL_ERR = 0.75
@@ -32,7 +33,7 @@ _GC_PAUSE_WARN_MS = 20.0
 _GC_PAUSE_ERR_MS = 50.0
 
 
-def analyze_system(channels: dict) -> list[Issue]:
+def analyze_system(channels: dict, game_timeline: list = None) -> list[Issue]:
     issues = []
 
     # --- CAN bus utilization ---
@@ -163,6 +164,32 @@ def analyze_system(channels: dict) -> list[Issue]:
                 time_end=warn_only[-1][0],
             ))
 
+    # --- Vision issue filtering helper ---
+    # When game_timeline is available, only report vision issues that overlap
+    # with AUTO, TELEOP, or TEST modes (skip DISABLED-only events).
+    def _overlaps_enabled(start: float, end: float) -> bool:
+        """Return True if [start, end] overlaps any non-DISABLED mode."""
+        if not game_timeline:
+            return True  # no timeline info — report everything
+        # Walk the timeline to find modes that overlap [start, end]
+        for i, (trans_t, mode) in enumerate(game_timeline):
+            # Determine the end of this mode segment
+            seg_end = game_timeline[i + 1][0] if i + 1 < len(game_timeline) else float("inf")
+            # Check overlap with [start, end]
+            if seg_end <= start:
+                continue
+            if trans_t >= end:
+                break
+            if mode != MODE_DISABLED:
+                return True
+        return False
+
+    def _point_is_enabled(t: float) -> bool:
+        """Return True if timestamp t falls in a non-DISABLED mode."""
+        if not game_timeline:
+            return True
+        return get_game_mode_at(game_timeline, t) != MODE_DISABLED
+
     # --- PhotonVision coprocessor disconnect ---
     # Detect when PhotonVision NT client disconnects (camera/coprocessor dropped out)
     pv_connected_keys = find_channels(channels, "NTClients", "photonvision", "Connected")
@@ -190,6 +217,8 @@ def analyze_system(channels: dict) -> list[Issue]:
                         reconnect_t = pv_conn[j][0]
                         break
                 end_t = reconnect_t if reconnect_t else pv_conn[-1][0]
+                if not _overlaps_enabled(t_cur, end_t):
+                    continue
                 dur = end_t - t_cur
                 reconn_str = (f", reconnected at {fmt_time(reconnect_t)}"
                               if reconnect_t else ", did not reconnect")
@@ -203,70 +232,102 @@ def analyze_system(channels: dict) -> list[Issue]:
                     time_end=end_t,
                 ))
 
-    # --- PhotonAlerts/warnings and errors ---
-    # Detect non-empty alert strings from PhotonVision.
-    # WPILib Alerts are string arrays; short garbled entries (from binary
-    # mis-decode) are filtered out — only report messages ≥ 5 chars.
-    _MIN_ALERT_LEN = 5
+    # --- PhotonAlerts: per-camera disconnect tracking ---
+    # PhotonVision warnings include messages like:
+    #   "PhotonCamera 'Back_Arducam_OV9782_F' is disconnected."
+    #   "PhotonVision coprocessor at path /photonvision/Left_... is not connected to the TimeSyncServer?..."
+    # Track disconnect spans per camera name so the ERR output is specific.
+    import re
+    _CAM_DISCONNECT_RE = re.compile(r"PhotonCamera '([^']+)' is disconnected")
+    _COPRO_DISCONNECT_RE = re.compile(
+        r"coprocessor at path /photonvision/(\S+) is not connected to the TimeSyncServer")
+
     for alert_key, label in [
         ("/RealOutputs/PhotonAlerts/warnings", "warning"),
         ("/RealOutputs/PhotonAlerts/errors", "error"),
     ]:
         pv_alerts = channels.get(alert_key, [])
+        if not pv_alerts:
+            continue
+
+        # Build per-camera timeline: for each timestamp, which cameras are alerting
+        # cam_name -> list of (timestamp, present_bool)
+        cam_events: dict[str, list[tuple[float, bool]]] = {}
+        # Track unrecognized alert messages separately
+        unrecognized: list[tuple[float, str]] = []
+
+        prev_cameras: set[str] = set()
         for ts, val in pv_alerts:
             if not isinstance(val, list):
                 continue
+            current_cameras: set[str] = set()
             for s in val:
-                if not isinstance(s, str):
+                if not isinstance(s, str) or not s.strip():
                     continue
+                m = _CAM_DISCONNECT_RE.search(s)
+                if m:
+                    current_cameras.add(m.group(1))
+                    continue
+                m = _COPRO_DISCONNECT_RE.search(s)
+                if m:
+                    current_cameras.add(m.group(1))
+                    continue
+                # Unrecognized but non-trivial message
                 clean = "".join(c for c in s if c.isprintable()).strip()
-                if len(clean) >= _MIN_ALERT_LEN:
-                    sev = SEVERITY_ERR if label == "error" else SEVERITY_ERR
-                    issues.append(Issue(
-                        severity=sev,
-                        subsystem="VISION",
-                        message=f"PhotonAlert {label} @ {fmt_time(ts)}: "
-                                f"{clean[:120]}",
-                        time_start=ts,
-                    ))
+                if len(clean) >= 5:
+                    unrecognized.append((ts, clean))
 
-    # Count PhotonAlert state changes as camera dropout indicators.
-    # When the warnings array goes from empty to non-empty, a camera issue
-    # started; when it goes back to empty, it recovered.
-    pv_warn_raw = channels.get("/RealOutputs/PhotonAlerts/warnings", [])
-    if len(pv_warn_raw) >= 2:
-        dropout_start = None
-        for i, (ts, val) in enumerate(pv_warn_raw):
-            has_alert = (isinstance(val, list) and
-                         any(s.strip() for s in val if isinstance(s, str)))
-            if has_alert and dropout_start is None:
-                dropout_start = ts
-            elif not has_alert and dropout_start is not None:
-                dur = ts - dropout_start
-                if dur >= 0.1:  # ignore sub-100ms flickers
+            # Record state transitions for each camera
+            appeared = current_cameras - prev_cameras
+            disappeared = prev_cameras - current_cameras
+            for cam in appeared:
+                cam_events.setdefault(cam, []).append((ts, True))
+            for cam in disappeared:
+                cam_events.setdefault(cam, []).append((ts, False))
+            prev_cameras = current_cameras
+
+        # Convert per-camera events into disconnect spans
+        for cam, events in sorted(cam_events.items()):
+            disconnect_start = None
+            for ts, is_disconnected in events:
+                if is_disconnected and disconnect_start is None:
+                    disconnect_start = ts
+                elif not is_disconnected and disconnect_start is not None:
+                    if _overlaps_enabled(disconnect_start, ts):
+                        dur = ts - disconnect_start
+                        issues.append(Issue(
+                            severity=SEVERITY_ERR,
+                            subsystem="VISION",
+                            message=f"Camera '{cam}' disconnected "
+                                    f"{fmt_time(disconnect_start)}–{fmt_time(ts)} "
+                                    f"({dur:.1f}s)",
+                            time_start=disconnect_start,
+                            time_end=ts,
+                        ))
+                    disconnect_start = None
+            # Still disconnected at end of log
+            if disconnect_start is not None:
+                end_t = pv_alerts[-1][0]
+                if _overlaps_enabled(disconnect_start, end_t):
+                    dur = end_t - disconnect_start
                     issues.append(Issue(
                         severity=SEVERITY_ERR,
                         subsystem="VISION",
-                        message=f"PhotonVision camera alert active "
-                                f"{fmt_time(dropout_start)}–{fmt_time(ts)} "
-                                f"({dur:.1f}s)",
-                        time_start=dropout_start,
-                        time_end=ts,
+                        message=f"Camera '{cam}' disconnected at "
+                                f"{fmt_time(disconnect_start)} ({dur:.1f}s) "
+                                f"— did not reconnect",
+                        time_start=disconnect_start,
+                        time_end=end_t,
                     ))
-                dropout_start = None
-        # If alert was still active at end of log
-        if dropout_start is not None:
-            end_t = pv_warn_raw[-1][0]
-            dur = end_t - dropout_start
-            if dur >= 0.1:
+
+        # Report any unrecognized alerts (only during enabled modes)
+        for ts, msg in unrecognized:
+            if _point_is_enabled(ts):
                 issues.append(Issue(
                     severity=SEVERITY_ERR,
                     subsystem="VISION",
-                    message=f"PhotonVision camera alert active "
-                            f"{fmt_time(dropout_start)}–{fmt_time(end_t)} "
-                            f"({dur:.1f}s) — did not clear",
-                    time_start=dropout_start,
-                    time_end=end_t,
+                    message=f"PhotonAlert {label} @ {fmt_time(ts)}: {msg[:120]}",
+                    time_start=ts,
                 ))
 
     return issues

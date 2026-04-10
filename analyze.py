@@ -222,7 +222,7 @@ def analyze_file(filepath: str, can_map: dict, subsystem_filter: str = None,
     elec_issues = analyze_electrical(channels, can_map)
     mech_issues = analyze_mechanical(channels, can_map, config=config)
     radio_issues = analyze_radio(channels)
-    system_issues = analyze_system(channels)
+    system_issues = analyze_system(channels, game_timeline=game_timeline)
 
     # Collect all device channels for motor group analysis
     all_device_channels = dict(channels)
