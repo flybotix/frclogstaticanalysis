@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from analyzers.electrical import Issue, SEVERITY_ERR, SEVERITY_WARN, SEVERITY_INFO, SEVERITY_OK
 
 
-DEFAULT_SUBSYSTEMS = ["ELECTRICAL", "RADIO", "SHOOTER", "INTAKE", "TURRET", "SWERVE", "CAN", "MOTORS"]
+DEFAULT_SUBSYSTEMS = ["ELECTRICAL", "RADIO", "SHOOTER", "INTAKE", "TURRET", "SWERVE", "VISION", "CAN", "MOTORS"]
 
 # HOOT and REVLOG issues are merged into MOTORS for display
 _MOTOR_SUBSYSTEMS = {"HOOT", "REVLOG"}
