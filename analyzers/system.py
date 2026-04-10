@@ -87,7 +87,7 @@ def analyze_system(channels: dict) -> list[Issue]:
                           for s, e, _ in err_spans)
             if not already:
                 issues.append(Issue(
-                    severity=SEVERITY_WARN,
+                    severity=SEVERITY_ERR,
                     subsystem="ELECTRICAL",
                     message=f"roboRIO CPU temperature elevated "
                             f"{fmt_time(start)}–{fmt_time(end)} "

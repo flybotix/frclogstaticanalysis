@@ -24,12 +24,12 @@ _CRITICAL_FAULTS = [
     "Fault_Hardware",
     "Fault_BridgeBrownout",
     "Fault_BootDuringEnable",
+    "Fault_DeviceTemp",
+    "Fault_ProcTemp",
 ]
 
 _WARN_FAULTS = [
     "Fault_Undervoltage",
-    "Fault_DeviceTemp",
-    "Fault_ProcTemp",
     "Fault_OverSupplyV",
     "Fault_UnstableSupplyV",
     "Fault_BadMagnet",
@@ -194,7 +194,7 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
                 hot = find_threshold_spans(temp_series, _TEMP_WARN_C, _TEMP_MIN_DUR, above=True)
                 for start, end, peak in hot:
                     issues.append(Issue(
-                        severity=SEVERITY_WARN,
+                        severity=SEVERITY_ERR,
                         subsystem=subsystem,
                         message=f"{label} over-temperature "
                                 f"{fmt_time(start)}–{fmt_time(end)} "
@@ -625,7 +625,7 @@ def analyze_hoot(channels: dict, can_map: dict = None, bus_name: str = "",
                     _PIGEON_TEMP_MIN_DUR, above=True)
                 for start, end, peak in hot:
                     issues.append(Issue(
-                        severity=SEVERITY_WARN,
+                        severity=SEVERITY_ERR,
                         subsystem=subsystem,
                         message=f"{label} IMU over-temperature "
                                 f"{fmt_time(start)}–{fmt_time(end)} "

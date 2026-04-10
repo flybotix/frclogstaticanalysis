@@ -121,7 +121,26 @@ def discover_by_match(directory: str, match_id: str) -> dict:
             f_upper = f.upper()
             # Check if match_id appears as a delimited component
             # e.g., "VAALE1_Q32_" or "_Q32_" in the filename
-            if f"_{match_id_upper}_" in f_upper or f_upper.startswith(f"{match_id_upper}_"):
+            # Split filename into underscore-delimited parts and check if
+            # the match ID matches the event_matchid prefix (e.g., "P6" in
+            # "CHCMP_P6_rio_...") or appears as a standalone segment.
+            name_parts = f_upper.split("_")
+            # Build candidate component strings: "CHCMP_P6" from parts [0,1]
+            has_match = (f"_{match_id_upper}_" in f_upper
+                         or f_upper.startswith(f"{match_id_upper}_"))
+            if not has_match:
+                # Check if any single part or consecutive pair of parts ends
+                # with the match ID (handles "CHCMP_P6" when searching "P6")
+                for i, part in enumerate(name_parts):
+                    if part == match_id_upper:
+                        has_match = True
+                        break
+                    if i > 0:
+                        compound = name_parts[i - 1] + "_" + part
+                        if compound.endswith("_" + match_id_upper):
+                            has_match = True
+                            break
+            if has_match:
                 hoot_files.append(os.path.join(dirpath, f))
                 # Extract timestamp from filename (YYYY-MM-DD_HH-MM-SS pattern)
                 if extracted_ts is None:
@@ -129,15 +148,47 @@ def discover_by_match(directory: str, match_id: str) -> dict:
                     if ts_match:
                         extracted_ts = ts_match.group(1)
 
-    if not hoot_files:
+    # Also search for wpilog files by match ID directly, since wpilog
+    # filenames may contain the match ID (e.g., "akit_..._chcmp_p6.wpilog")
+    # but have a slightly different timestamp than hoot files.
+    wpilog_by_match = None
+    for dirpath, _dirnames, filenames in os.walk(directory):
+        for f in filenames:
+            if not f.endswith(".wpilog") or f.endswith("_converted.wpilog"):
+                continue
+            f_upper = f.upper()
+            name_parts = f_upper.split("_")
+            has_match = (f"_{match_id_upper}_" in f_upper
+                         or f"_{match_id_upper}." in f_upper
+                         or f_upper.startswith(f"{match_id_upper}_"))
+            if not has_match:
+                for i, part in enumerate(name_parts):
+                    # Strip extension from last part
+                    clean = part.replace(".WPILOG", "")
+                    if clean == match_id_upper:
+                        has_match = True
+                        break
+                    if i > 0:
+                        compound = name_parts[i - 1] + "_" + clean
+                        if compound.endswith("_" + match_id_upper):
+                            has_match = True
+                            break
+            if has_match:
+                wpilog_by_match = os.path.join(dirpath, f)
+                break
+        if wpilog_by_match:
+            break
+
+    if not hoot_files and not wpilog_by_match:
         return {"wpilog": None, "revlog": None, "hoot": []}
 
     # Use the extracted timestamp to find wpilog/revlog
-    result = {"wpilog": None, "revlog": None, "hoot": hoot_files}
+    result = {"wpilog": wpilog_by_match, "revlog": None, "hoot": hoot_files}
 
     if extracted_ts:
         ts_discovery = discover_files(directory, extracted_ts)
-        result["wpilog"] = ts_discovery["wpilog"]
+        if not result["wpilog"]:
+            result["wpilog"] = ts_discovery["wpilog"]
         result["revlog"] = ts_discovery["revlog"]
         # Merge any hoot files found by timestamp that weren't already matched
         for h in ts_discovery["hoot"]:

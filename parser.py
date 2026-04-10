@@ -200,14 +200,14 @@ def get_enabled_intervals(channels: dict) -> list[tuple[float, float]]:
 
 def get_match_info(channels: dict) -> dict:
     """Extract match metadata from DriverStation channels."""
-    def first(ch):
+    def last(ch):
         vals = channels.get(ch, [])
-        return vals[0][1] if vals else None
+        return vals[-1][1] if vals else None
 
-    match_type = first("/DriverStation/MatchType")
-    match_num = first("/DriverStation/MatchNumber")
-    event = first("/DriverStation/EventName")
-    alliance = first("/DriverStation/AllianceStation")
+    match_type = last("/DriverStation/MatchType")
+    match_num = last("/DriverStation/MatchNumber")
+    event = last("/DriverStation/EventName")
+    alliance = last("/DriverStation/AllianceStation")
 
     type_names = {0: "Practice", 1: "Practice", 2: "Qual", 3: "Elim", 4: "Elim"}
     alliance_names = {

@@ -166,7 +166,8 @@ def _motor_issue_summary(issues: list) -> str:
     """One-line summary of a motor's issues."""
     parts = []
     starved = [i for i in issues if "POWER STARVED" in i.message]
-    rebooted = [i for i in issues if "REBOOTED" in i.message or "BootDuringEnable" in i.message]
+    rebooted = [i for i in issues if "REBOOTED" in i.message or
+                ("BootDuringEnable" in i.message and "sticky" not in i.message)]
     brownout = [i for i in issues if "BridgeBrownout" in i.message and "sticky" not in i.message]
     hw_fault = [i for i in issues if "hardware fault" in i.message.lower()
                 or "Hardware" in i.message and "Fault_" in i.message and "sticky" not in i.message]
