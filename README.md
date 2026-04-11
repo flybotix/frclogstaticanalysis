@@ -448,8 +448,19 @@ python3 analyze.py --hoot canivore.hoot rio.hoot
 -i, --info             Show all issues (info, warnings, errors) in detail sections
 -v, --verbose          Show all decoded channels
 -b, --batch DIR        Batch-analyze all .wpilog files in a directory
+-g, --generic          Skip can_map.json (analyze without team-specific config)
     --clean            Remove temporary files (*_converted.wpilog) after analysis
 ```
+
+### Generic mode (analyzing another team's logs)
+
+The `--generic` flag skips loading `can_map.json`, so no team-specific device labels, subsystem mappings, motor groups, or swerve yaw analysis are applied. Useful when running the analyzer on logs from another team whose electrical layout, CAN IDs, and subsystem organization differ from yours:
+
+```bash
+python3 analyze.py -g data/other_team/akit_log.wpilog
+```
+
+In generic mode, motor controller issues appear under the default `MOTORS` subsystem using their raw CAN identifiers (e.g., `TalonFX-11`), and checks that require configured inputs (like swerve yaw analysis) are skipped.
 
 ### Filter to one subsystem
 

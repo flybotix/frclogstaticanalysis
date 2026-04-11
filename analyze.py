@@ -369,6 +369,8 @@ def main():
                         help="Batch-analyze all .wpilog files in directory")
     parser.add_argument("--clean", action="store_true",
                         help="Remove temporary files (*_converted.wpilog) after analysis")
+    parser.add_argument("--generic", "-g", action="store_true",
+                        help="Skip loading can_map.json (useful for analyzing other teams' logs)")
 
     args = parser.parse_args()
 
@@ -379,7 +381,10 @@ def main():
     else:
         detail_level = "ERR"
 
-    can_map, config = load_can_map()
+    if args.generic:
+        can_map, config = {}, load_device_config({})
+    else:
+        can_map, config = load_can_map()
 
     if args.batch:
         batch_mode(args.batch, can_map)
