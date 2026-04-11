@@ -4,8 +4,9 @@ System health detection:
   - CPU temperature (roboRIO overheating)
   - Code loop overruns (robot code can't keep up with cycle time)
   - GC pauses (Java garbage collection stalls)
-  - PhotonVision coprocessor disconnect (NT client drops)
+  - Vision coprocessor disconnect (NT client drops, PhotonVision/Limelight)
   - PhotonAlerts/warnings (camera errors reported by PhotonVision)
+  - Limelight target-lost spans (sustained Tv=false during enabled)
 """
 
 from signals import get, get_bool, find_channels, find_threshold_spans, fmt_time
@@ -190,33 +191,57 @@ def analyze_system(channels: dict, game_timeline: list = None) -> list[Issue]:
             return True
         return get_game_mode_at(game_timeline, t) != MODE_DISABLED
 
-    # --- PhotonVision coprocessor disconnect ---
-    # Detect when PhotonVision NT client disconnects (camera/coprocessor dropped out)
-    pv_connected_keys = find_channels(channels, "NTClients", "photonvision", "Connected")
-    for pv_key in pv_connected_keys:
-        pv_conn = channels.get(pv_key, [])
-        if len(pv_conn) < 2:
+    def _enabled_overlap_duration(start: float, end: float) -> float:
+        """Return total seconds of [start, end] that fall in non-DISABLED modes."""
+        if not game_timeline:
+            return end - start
+        total = 0.0
+        for i, (trans_t, mode) in enumerate(game_timeline):
+            seg_end = game_timeline[i + 1][0] if i + 1 < len(game_timeline) else float("inf")
+            if seg_end <= start:
+                continue
+            if trans_t >= end:
+                break
+            if mode == MODE_DISABLED:
+                continue
+            total += min(seg_end, end) - max(trans_t, start)
+        return max(total, 0.0)
+
+    # --- Vision coprocessor NT client disconnect ---
+    # Detect when any vision coprocessor (PhotonVision, Limelight, etc.) NT client
+    # disconnects during enabled modes. Works for any NT client matching a known
+    # vision coprocessor name prefix.
+    _VISION_CLIENT_PREFIXES = ("photonvision", "limelight")
+    vision_client_keys = []
+    for prefix in _VISION_CLIENT_PREFIXES:
+        vision_client_keys.extend(
+            find_channels(channels, "NTClients", prefix, "Connected"))
+
+    for conn_key in vision_client_keys:
+        conn = channels.get(conn_key, [])
+        if len(conn) < 2:
             continue
-        # Extract the client name from the key (e.g. "photonvision@2")
-        parts = pv_key.split("/")
-        client_name = "PhotonVision"
+        # Extract the client name from the key (e.g. "photonvision@2" or "limelight-back@4")
+        parts = conn_key.split("/")
+        client_name = "vision coprocessor"
         for p in parts:
-            if "photonvision" in p.lower():
+            pl = p.lower()
+            if any(pl.startswith(pref) for pref in _VISION_CLIENT_PREFIXES):
                 client_name = p
                 break
 
         # Find disconnect events (transition to False)
-        for i in range(1, len(pv_conn)):
-            t_prev, v_prev = pv_conn[i - 1]
-            t_cur, v_cur = pv_conn[i]
+        for i in range(1, len(conn)):
+            t_prev, v_prev = conn[i - 1]
+            t_cur, v_cur = conn[i]
             if v_prev is True and v_cur is False:
                 # Find when it reconnects (if ever)
                 reconnect_t = None
-                for j in range(i + 1, len(pv_conn)):
-                    if pv_conn[j][1] is True:
-                        reconnect_t = pv_conn[j][0]
+                for j in range(i + 1, len(conn)):
+                    if conn[j][1] is True:
+                        reconnect_t = conn[j][0]
                         break
-                end_t = reconnect_t if reconnect_t else pv_conn[-1][0]
+                end_t = reconnect_t if reconnect_t else conn[-1][0]
                 if not _overlaps_enabled(t_cur, end_t):
                     continue
                 dur = end_t - t_cur
@@ -329,5 +354,67 @@ def analyze_system(channels: dict, game_timeline: list = None) -> list[Issue]:
                     message=f"PhotonAlert {label} @ {fmt_time(ts)}: {msg[:120]}",
                     time_start=ts,
                 ))
+
+    # --- Limelight per-camera target-lost detection ---
+    # Limelight publishes /RealOutputs/limelight-<name>/{Tv,TagID,botpose,...}.
+    # Tv is a boolean that publishes only on state changes, so we hold each
+    # value until the next transition. Sustained Tv=false during enabled modes
+    # means the camera is online but has no AprilTag in view.
+    # Match the thresholds used for PhotonVision "vision dropout" (>=3s = ERR,
+    # >=1s = WARN) so both systems surface at the same severity level.
+    _LL_TARGET_LOST_ERR = 3.0
+    _LL_TARGET_LOST_WARN = 1.0
+
+    # Discover Limelight instances by their /RealOutputs/limelight-<name>/ path.
+    limelight_channels = [k for k in channels
+                          if "/limelight-" in k and k.startswith("/RealOutputs/")]
+    limelight_instances: dict[str, dict[str, str]] = {}
+    for path in limelight_channels:
+        # /RealOutputs/limelight-<name>/<field>  →  name, field
+        parts = path.split("/")
+        if len(parts) >= 4 and parts[2].startswith("limelight-"):
+            ll_name = parts[2]
+            field = parts[3]
+            limelight_instances.setdefault(ll_name, {})[field] = path
+
+    for ll_name in sorted(limelight_instances):
+        fields = limelight_instances[ll_name]
+        # Find Tv channel (case-insensitive)
+        tv_path = None
+        for f, p in fields.items():
+            if f.lower() == "tv":
+                tv_path = p
+                break
+        if not tv_path:
+            continue
+
+        tv_data = channels.get(tv_path, [])
+        if len(tv_data) < 2:
+            continue
+
+        # Build contiguous "Tv held value" spans. Each sample's value holds
+        # until the next sample's timestamp (or end of data for the last one).
+        # Threshold comparison uses only the enabled-mode portion of each span
+        # so that pre-match/post-match "no target" tails don't get reported.
+        end_of_data = tv_data[-1][0]
+        for i, (t, v) in enumerate(tv_data):
+            if bool(v):
+                continue
+            hold_end = tv_data[i + 1][0] if i + 1 < len(tv_data) else end_of_data
+            enabled_dur = _enabled_overlap_duration(t, hold_end)
+            if enabled_dur < _LL_TARGET_LOST_WARN:
+                continue
+            severity = (SEVERITY_ERR if enabled_dur >= _LL_TARGET_LOST_ERR
+                        else SEVERITY_WARN)
+            suffix = " — no AprilTag detections" if severity == SEVERITY_ERR else ""
+            issues.append(Issue(
+                severity=severity,
+                subsystem="VISION",
+                message=f"Camera '{ll_name}' target lost "
+                        f"{fmt_time(t)}–{fmt_time(hold_end)} "
+                        f"({enabled_dur:.1f}s enabled){suffix}",
+                time_start=t,
+                time_end=hold_end,
+            ))
 
     return issues

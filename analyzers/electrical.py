@@ -68,7 +68,7 @@ def analyze_electrical(channels: dict, can_map: dict = None) -> list[Issue]:
             ))
 
         # --- Voltage sags (require 2V drop in 0.5s to reduce normal-operation noise) ---
-        drops = find_drops(batt, drop_amount=2.0, window_sec=0.5)
+        drops = find_drops(batt, drop_amount=3.0, window_sec=0.5)
         if drops:
             min_v = min(v2 for _, _, v2 in drops)
             if min_v < 7.0:
