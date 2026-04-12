@@ -395,6 +395,8 @@ The discovery logic handles the different filename conventions used by each vend
 - `.revlog` — `REV_YYYYMMDD_HHMMSS.revlog` (e.g., `REV_20260324_233816.revlog`)
 - `.hoot` — `*_YYYY-MM-DD_HH-MM-SS.hoot` (e.g., `rio_2026-03-24_23-38-19.hoot`)
 
+Revlog files are matched at **minute precision** (`YYYYMMDDHHMM`) against the requested timestamp. Seconds are intentionally ignored to tolerate small clock skew between the roboRIO and the REV StatusLogger, but revlogs from a different minute — which typically indicates a different logging session — will not be matched. If you need to analyze a revlog whose session start does not fall within the same minute as the match, pass it explicitly via `--revlog`.
+
 ### Auto-discovery by match ID
 
 If you have `.hoot` files with FMS match IDs in their filenames (e.g., `VAALE1_Q32_rio_2025-09-27_14-08-53.hoot`), you can discover all logs for a match by its ID:

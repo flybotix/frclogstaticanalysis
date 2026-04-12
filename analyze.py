@@ -66,8 +66,15 @@ def discover_files(directory: str, timestamp: str) -> dict:
     ts = timestamp.replace(":", "-")
     # YY variant for wpilog files (2026-03-24 → 26-03-24)
     ts_short = ts[2:] if len(ts) >= 4 and ts[:4].isdigit() else ts
-    # Compact variant for revlog files (2026-03-24_23-38 → 2026032423-38 → 20260324)
+    # Compact variant for revlog files (2026-03-24_23-38-19 → 20260324233819)
     ts_compact = re.sub(r"[-_:]", "", ts)
+    # Revlog matches at minute precision (YYYYMMDDHHMM — 12 chars). Seconds
+    # are intentionally excluded so small clock skew between the roboRIO and
+    # the REV StatusLogger doesn't cause a miss, but any revlog from a
+    # different minute (and therefore likely a different logging session)
+    # is correctly rejected.
+    rev_prefix_len = min(len(ts_compact), 12)
+    rev_prefix = ts_compact[:rev_prefix_len]
 
     for dirpath, _dirnames, filenames in os.walk(directory):
         for f in filenames:
@@ -78,8 +85,14 @@ def discover_files(directory: str, timestamp: str) -> dict:
                     result["wpilog"] = full
 
             elif f.endswith(".revlog"):
-                if ts_compact[:8] in f:
-                    result["revlog"] = full
+                # Extract REV session start timestamp (YYYYMMDD_HHMMSS) and
+                # compare at minute precision (strip underscore, take first
+                # 12 chars = date + hour + minute).
+                rev_match = re.search(r"(\d{8})_(\d{6})", f)
+                if rev_match:
+                    rev_compact = rev_match.group(1) + rev_match.group(2)
+                    if rev_compact[:rev_prefix_len] == rev_prefix:
+                        result["revlog"] = full
 
             elif f.endswith(".hoot"):
                 if ts in f:
@@ -151,7 +164,10 @@ def discover_by_match(directory: str, match_id: str) -> dict:
     # Also search for wpilog files by match ID directly, since wpilog
     # filenames may contain the match ID (e.g., "akit_..._chcmp_p6.wpilog")
     # but have a slightly different timestamp than hoot files.
-    wpilog_by_match = None
+    # When multiple wpilog files match (e.g., both an AdvantageKit log and
+    # an FRC Driver Station replay log), prefer AdvantageKit ("akit_*") since
+    # DS replay logs lack /RealOutputs/ channels needed for analysis.
+    wpilog_candidates = []
     for dirpath, _dirnames, filenames in os.walk(directory):
         for f in filenames:
             if not f.endswith(".wpilog") or f.endswith("_converted.wpilog"):
@@ -174,10 +190,14 @@ def discover_by_match(directory: str, match_id: str) -> dict:
                             has_match = True
                             break
             if has_match:
-                wpilog_by_match = os.path.join(dirpath, f)
-                break
-        if wpilog_by_match:
-            break
+                wpilog_candidates.append(os.path.join(dirpath, f))
+
+    wpilog_by_match = None
+    if wpilog_candidates:
+        # Prefer AdvantageKit logs over FRC Driver Station replay logs
+        akit = [p for p in wpilog_candidates
+                if os.path.basename(p).lower().startswith("akit_")]
+        wpilog_by_match = akit[0] if akit else wpilog_candidates[0]
 
     if not hoot_files and not wpilog_by_match:
         return {"wpilog": None, "revlog": None, "hoot": []}
