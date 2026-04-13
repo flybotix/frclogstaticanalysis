@@ -1,0 +1,90 @@
+name: Build Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            binary_name: frclog-analyzer
+          - os: macos-latest
+            target: macos
+            binary_name: frclog-analyzer
+          - os: windows-latest
+            target: windows
+            binary_name: frclog-analyzer.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        shell: bash
+        run: |
+          pyinstaller --onefile --name ${{ matrix.binary_name }} \
+            --hidden-import=analyzers \
+            --hidden-import=analyzers.electrical \
+            --hidden-import=analyzers.mechanical \
+            --hidden-import=analyzers.hoot \
+            --hidden-import=analyzers.motor_groups \
+            --hidden-import=analyzers.revlog \
+            --hidden-import=analyzers.subsystems \
+            analyze.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/${{ matrix.binary_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-linux
+          path: dist/linux
+      - name: Download macOS Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-macos
+          path: dist/macos
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-windows
+          path: dist/windows
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/linux/frclog-analyzer
+            dist/macos/frclog-analyzer
+            dist/windows/frclog-analyzer.exe
